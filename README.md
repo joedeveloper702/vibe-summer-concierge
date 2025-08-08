@@ -1,6 +1,6 @@
 # Vibe Summer Concierge
 
-Intelligent calendar management, focus music, and AI-powered task synthesis powered by Cloudflare Workers.
+Intelligent calendar management, focus music, and AI-powered task synthesis powered by Cloudflare Workers. Built for the https://vibesummer.honc.dev/#challenges challenges
 
 ## Features
 
