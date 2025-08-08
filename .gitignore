@@ -20,6 +20,9 @@ dist/
 # Cloudflare
 wrangler.toml
 
+# Drizzle config with credentials
+drizzle.config.ts
+
 # Database
 *.db
 *.sqlite

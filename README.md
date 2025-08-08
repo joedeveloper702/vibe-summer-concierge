@@ -54,9 +54,10 @@ wrangler r2 bucket create vibe-summer-concierge-storage
 
 ### 3. Configuration
 
-1. Copy the example configuration:
+1. Copy the example configurations:
    ```bash
    cp wrangler.toml.example wrangler.toml
+   cp drizzle.config.ts.example drizzle.config.ts
    ```
 
 2. Update `wrangler.toml` with your Cloudflare resource IDs:
@@ -64,6 +65,18 @@ wrangler r2 bucket create vibe-summer-concierge-storage
    - Replace `YOUR_DATABASE_ID` with the D1 database ID from step 2
    - Replace `YOUR_KV_NAMESPACE_ID` with the KV namespace ID from step 2
    - Replace `YOUR_BUCKET_NAME` with your R2 bucket name
+
+3. Update `drizzle.config.ts` with your Cloudflare credentials:
+   - Replace `YOUR_ACCOUNT_ID` with your Cloudflare account ID
+   - Replace `YOUR_DATABASE_ID` with the D1 database ID
+   - Replace `YOUR_CLOUDFLARE_API_TOKEN` with your Cloudflare API token
+
+   **Alternative**: Set environment variables:
+   ```bash
+   export CLOUDFLARE_ACCOUNT_ID="your_account_id"
+   export CLOUDFLARE_DATABASE_ID="your_database_id" 
+   export CLOUDFLARE_D1_TOKEN="your_api_token"
+   ```
 
 ### 4. Environment Variables
 

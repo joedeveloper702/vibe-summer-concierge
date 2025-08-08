@@ -38,6 +38,17 @@ This document lists all the environment variables needed for the Vibe Summer Con
 - `id` (KV namespace) - KV namespace ID
 - `bucket_name` - R2 bucket name
 
+## Drizzle Configuration (set in drizzle.config.ts or environment variables)
+
+### Option 1: Environment Variables (Recommended)
+Set these environment variables:
+- `CLOUDFLARE_ACCOUNT_ID` - Your Cloudflare account ID
+- `CLOUDFLARE_DATABASE_ID` - Your D1 database ID
+- `CLOUDFLARE_D1_TOKEN` - Your Cloudflare API token (get from Cloudflare dashboard)
+
+### Option 2: Direct Configuration
+Update `drizzle.config.ts` with your actual values (less secure).
+
 ## Setting Secrets
 
 Use the Wrangler CLI to set secrets:
