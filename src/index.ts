@@ -1183,167 +1183,146 @@ app.get("/docs", async (c) => {
 // OpenAPI specification
 app.get("/openapi.json", c => {
   return c.json({
-    openapi: "3.0.0",
-    info: {
-      title: "Vibe Summer Concierge MCP Server",
-      version: "1.0.0",
-      description: "Intelligent calendar management, focus music, and AI-powered task synthesis",
+    "openapi": "3.0.0",
+    "info": {
+      "title": "Vibe Summer Concierge MCP Server",
+      "version": "1.0.0",
+      "description": "Intelligent calendar management, focus music, and AI-powered task synthesis"
     },
-    servers: [
+    "servers": [
       {
-        url: "/",
-        description: "Development server"
+        "url": "https://vibe-summer-concierge-production.josephfarrar.workers.dev"
       }
     ],
-    paths: {
-      "/api/user/profile": {
-        get: {
-          summary: "Get user profile",
-          description: "Retrieve the authenticated user's profile information",
-          responses: {
+    "paths": {
+      "/.well-known/oauth-authorization-server": {
+        "get": {
+          "summary": "OAuth authorization server metadata",
+          "responses": {
             "200": {
-              description: "User profile",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      user: {
-                        type: "object",
-                        properties: {
-                          id: { type: "string" },
-                          name: { type: "string" },
-                          email: { type: "string" }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
-            },
-            "401": {
-              description: "Not authenticated"
+              "description": "OAuth server configuration"
             }
-          },
-          security: [{ bearerAuth: [] }]
+          }
         }
       },
-      "/api/user/connections": {
-        get: {
-          summary: "Get OAuth connections",
-          description: "Retrieve user's OAuth provider connections",
-          responses: {
+      "/.well-known/oauth-protected-resource": {
+        "get": {
+          "summary": "OAuth protected resource metadata",
+          "responses": {
             "200": {
-              description: "OAuth connections",
-              content: {
-                "application/json": {
-                  schema: {
-                    type: "object",
-                    properties: {
-                      connections: {
-                        type: "array",
-                        items: {
-                          type: "object",
-                          properties: {
-                            provider: { type: "string", enum: ["google", "spotify", "clickup"] },
-                            createdAt: { type: "string", format: "date-time" },
-                            expiresAt: { type: "string", format: "date-time" }
-                          }
-                        }
-                      }
-                    }
-                  }
-                }
-              }
+              "description": "Protected resource configuration"
             }
-          },
-          security: [{ bearerAuth: [] }]
+          }
+        }
+      },
+      "/login": {
+        "get": {
+          "summary": "Login page",
+          "responses": {
+            "200": {
+              "description": "HTML login form"
+            }
+          }
+        }
+      },
+      "/logout": {
+        "get": {
+          "summary": "Logout page",
+          "responses": {
+            "200": {
+              "description": "Logout confirmation"
+            }
+          }
+        }
+      },
+      "/api/auth/**": {
+        "get": {
+          "summary": "Better Auth endpoints"
+        },
+        "post": {
+          "summary": "Better Auth endpoints"
         }
       },
       "/oauth/connect/{provider}": {
-        post: {
-          summary: "Connect OAuth provider",
-          description: "Connect an OAuth provider using authorization code",
-          parameters: [
+        "post": {
+          "summary": "Connect OAuth provider",
+          "parameters": [
             {
-              name: "provider",
-              in: "path",
-              required: true,
-              schema: {
-                type: "string",
-                enum: ["google", "spotify", "clickup"]
+              "name": "provider",
+              "in": "path",
+              "required": true,
+              "schema": {
+                "type": "string",
+                "enum": ["google", "spotify", "clickup"]
               }
             }
-          ],
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                schema: {
-                  type: "object",
-                  properties: {
-                    code: { type: "string", description: "OAuth authorization code" }
-                  },
-                  required: ["code"]
-                }
-              }
-            }
-          },
-          responses: {
+          ]
+        }
+      },
+      "/api/user/profile": {
+        "get": {
+          "summary": "Get user profile",
+          "responses": {
             "200": {
-              description: "Successfully connected provider"
-            },
-            "400": {
-              description: "Invalid request or authorization code"
+              "description": "User profile data"
             }
-          },
-          security: [{ bearerAuth: [] }]
+          }
+        }
+      },
+      "/api/user/connections": {
+        "get": {
+          "summary": "Get OAuth connections",
+          "responses": {
+            "200": {
+              "description": "List of connected services"
+            }
+          }
+        }
+      },
+      "/api/user/music-sessions": {
+        "get": {
+          "summary": "Get music session history",
+          "responses": {
+            "200": {
+              "description": "List of music sessions"
+            }
+          }
+        }
+      },
+      "/api/user/task-history": {
+        "get": {
+          "summary": "Get task synthesis history",
+          "responses": {
+            "200": {
+              "description": "List of synthesized tasks"
+            }
+          }
         }
       },
       "/mcp": {
-        post: {
-          summary: "MCP Server Interface",
-          description: "Model Context Protocol server for AI tool integration",
-          requestBody: {
-            required: true,
-            content: {
-              "application/json": {
-                schema: {
-                  type: "object",
-                  properties: {
-                    jsonrpc: { type: "string", example: "2.0" },
-                    method: { type: "string", example: "tools/call" },
-                    params: { 
-                      type: "object",
-                      properties: {
-                        name: { type: "string", enum: ["calendar.manage", "music.focus", "tasks.synthesize"] },
-                        arguments: { type: "object" }
-                      }
-                    },
-                    id: { type: "string" }
-                  }
-                }
-              }
-            }
-          },
-          responses: {
-            "200": {
-              description: "MCP response"
-            },
-            "401": {
-              description: "Authentication required"
-            }
-          },
-          security: [{ bearerAuth: [] }]
+        "all": {
+          "summary": "MCP server endpoint",
+          "description": "Model Context Protocol server for calendar, music, and task tools"
         }
-      }
-    },
-    components: {
-      securitySchemes: {
-        bearerAuth: {
-          type: "http",
-          scheme: "bearer",
-          bearerFormat: "JWT"
+      },
+      "/webhooks/google": {
+        "post": {
+          "summary": "Google Calendar webhook"
+        }
+      },
+      "/webhooks/clickup": {
+        "post": {
+          "summary": "ClickUp webhook"
+        }
+      },
+      "/cron/calendar-defense": {
+        "post": {
+          "summary": "Calendar defense cron job"
+        }
+      },
+      "/cron/token-refresh": {
+        "post": {
+          "summary": "Token refresh cron job"
         }
       }
     }
