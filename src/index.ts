@@ -1134,6 +1134,52 @@ app.get("/api/user/task-history", async (c) => {
   return c.json({ history });
 });
 
+// API Documentation viewer
+app.get("/docs", async (c) => {
+  const requestUrl = new URL(c.req.url);
+  const baseUrl = `${requestUrl.protocol}//${requestUrl.host}`;
+  
+  return c.html(
+    html`
+<html lang="en">
+  <head>
+    <title>API Documentation | Vibe Summer Concierge</title>
+    <meta charSet="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="stylesheet" type="text/css" href="https://unpkg.com/swagger-ui-dist@5.9.0/swagger-ui.css" />
+    <style>
+      html { box-sizing: border-box; overflow: -moz-scrollbars-vertical; overflow-y: scroll; }
+      *, *:before, *:after { box-sizing: inherit; }
+      body { margin:0; background: #fafafa; }
+    </style>
+  </head>
+  <body>
+    <div id="swagger-ui"></div>
+    <script src="https://unpkg.com/swagger-ui-dist@5.9.0/swagger-ui-bundle.js"></script>
+    <script src="https://unpkg.com/swagger-ui-dist@5.9.0/swagger-ui-standalone-preset.js"></script>
+    <script>
+      window.onload = function() {
+        const ui = SwaggerUIBundle({
+          url: '${baseUrl}/openapi.json',
+          dom_id: '#swagger-ui',
+          deepLinking: true,
+          presets: [
+            SwaggerUIBundle.presets.apis,
+            SwaggerUIStandalonePreset
+          ],
+          plugins: [
+            SwaggerUIBundle.plugins.DownloadUrl
+          ],
+          layout: "StandaloneLayout"
+        });
+      };
+    </script>
+  </body>
+</html>
+`
+  );
+});
+
 // OpenAPI specification
 app.get("/openapi.json", c => {
   return c.json({
@@ -1149,11 +1195,169 @@ app.get("/openapi.json", c => {
         description: "Development server"
       }
     ],
-    paths: {}
+    paths: {
+      "/api/user/profile": {
+        get: {
+          summary: "Get user profile",
+          description: "Retrieve the authenticated user's profile information",
+          responses: {
+            "200": {
+              description: "User profile",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      user: {
+                        type: "object",
+                        properties: {
+                          id: { type: "string" },
+                          name: { type: "string" },
+                          email: { type: "string" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "401": {
+              description: "Not authenticated"
+            }
+          },
+          security: [{ bearerAuth: [] }]
+        }
+      },
+      "/api/user/connections": {
+        get: {
+          summary: "Get OAuth connections",
+          description: "Retrieve user's OAuth provider connections",
+          responses: {
+            "200": {
+              description: "OAuth connections",
+              content: {
+                "application/json": {
+                  schema: {
+                    type: "object",
+                    properties: {
+                      connections: {
+                        type: "array",
+                        items: {
+                          type: "object",
+                          properties: {
+                            provider: { type: "string", enum: ["google", "spotify", "clickup"] },
+                            createdAt: { type: "string", format: "date-time" },
+                            expiresAt: { type: "string", format: "date-time" }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          security: [{ bearerAuth: [] }]
+        }
+      },
+      "/oauth/connect/{provider}": {
+        post: {
+          summary: "Connect OAuth provider",
+          description: "Connect an OAuth provider using authorization code",
+          parameters: [
+            {
+              name: "provider",
+              in: "path",
+              required: true,
+              schema: {
+                type: "string",
+                enum: ["google", "spotify", "clickup"]
+              }
+            }
+          ],
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    code: { type: "string", description: "OAuth authorization code" }
+                  },
+                  required: ["code"]
+                }
+              }
+            }
+          },
+          responses: {
+            "200": {
+              description: "Successfully connected provider"
+            },
+            "400": {
+              description: "Invalid request or authorization code"
+            }
+          },
+          security: [{ bearerAuth: [] }]
+        }
+      },
+      "/mcp": {
+        post: {
+          summary: "MCP Server Interface",
+          description: "Model Context Protocol server for AI tool integration",
+          requestBody: {
+            required: true,
+            content: {
+              "application/json": {
+                schema: {
+                  type: "object",
+                  properties: {
+                    jsonrpc: { type: "string", example: "2.0" },
+                    method: { type: "string", example: "tools/call" },
+                    params: { 
+                      type: "object",
+                      properties: {
+                        name: { type: "string", enum: ["calendar.manage", "music.focus", "tasks.synthesize"] },
+                        arguments: { type: "object" }
+                      }
+                    },
+                    id: { type: "string" }
+                  }
+                }
+              }
+            }
+          },
+          responses: {
+            "200": {
+              description: "MCP response"
+            },
+            "401": {
+              description: "Authentication required"
+            }
+          },
+          security: [{ bearerAuth: [] }]
+        }
+      }
+    },
+    components: {
+      securitySchemes: {
+        bearerAuth: {
+          type: "http",
+          scheme: "bearer",
+          bearerFormat: "JWT"
+        }
+      }
+    }
   });
 });
 
 // Fiberplane API explorer
-app.use("/fp/*", createHonoMiddleware(app));
+app.use("/fp/*", createHonoMiddleware(app, {
+  libraryDebugMode: false,
+  monitor: {
+    fetch: true,
+    logging: true,
+    requests: true,
+  },
+}));
 
 export default app;
