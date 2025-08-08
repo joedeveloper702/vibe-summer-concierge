@@ -1,0 +1,36 @@
+name = "vibe-summer-concierge"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+compatibility_flags = ["nodejs_compat"]
+
+[env.production]
+# Replace with your Cloudflare account ID
+account_id = "YOUR_ACCOUNT_ID"
+
+# D1 Database binding
+[[env.production.d1_databases]]
+binding = "DB"
+# Replace with your database name and ID
+database_name = "YOUR_DATABASE_NAME"
+database_id = "YOUR_DATABASE_ID"
+migrations_dir = "drizzle"
+
+# KV namespace binding
+[[env.production.kv_namespaces]]
+binding = "KV"
+# Replace with your KV namespace ID
+id = "YOUR_KV_NAMESPACE_ID"
+
+# R2 bucket binding (create this bucket first)
+[[env.production.r2_buckets]]
+binding = "R2"
+# Replace with your bucket name
+bucket_name = "YOUR_BUCKET_NAME"
+
+# Environment variables
+[env.production.vars]
+NODE_ENV = "production"
+
+# Build configuration
+[build]
+command = "npm run build"
