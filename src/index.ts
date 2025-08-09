@@ -677,8 +677,24 @@ app.get("/.well-known/oauth-protected-resource", async (c) => {
   return c.json(metadata);
 });
 
+// Debug endpoint to check configuration
+app.get("/debug/auth", async (c) => {
+  return c.json({
+    hasClientId: !!c.env.FP_CLIENT_ID,
+    hasClientSecret: !!c.env.FP_CLIENT_SECRET,
+    hasAuthIssuer: !!c.env.FP_AUTH_ISSUER,
+    hasBetterAuthUrl: !!c.env.BETTER_AUTH_URL,
+    hasBetterAuthSecret: !!c.env.BETTER_AUTH_SECRET,
+    baseUrl: c.env.BETTER_AUTH_URL,
+    issuer: c.env.FP_AUTH_ISSUER,
+  });
+});
+
 // Authentication routes
 app.get("/login", async (c) => {
+  const requestUrl = new URL(c.req.url);
+  const baseUrl = `${requestUrl.protocol}//${requestUrl.host}`;
+  
   return c.html(
     html`
 <html lang="en">
@@ -689,37 +705,105 @@ app.get("/login", async (c) => {
     <style>
       body { font-family: system-ui, sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; }
       .login-container { text-align: center; }
-      .btn { background: #007bff; color: white; padding: 12px 24px; border: none; border-radius: 6px; cursor: pointer; font-size: 16px; }
+      .btn { background: #007bff; color: white; padding: 12px 24px; border: none; border-radius: 6px; cursor: pointer; font-size: 16px; text-decoration: none; display: inline-block; }
+      .btn:hover { background: #0056b3; }
+      .error { color: red; margin-top: 10px; }
+      .loading { color: #666; margin-top: 10px; }
     </style>
   </head>
   <body>
     <div class="login-container">
       <h1>Vibe Summer Concierge</h1>
       <p>Intelligent calendar management, focus music, and AI-powered task synthesis</p>
-      <button class="btn" onclick="startLogin()">Login with Fiberplane</button>
+      <button class="btn" onclick="startLogin()" id="loginBtn">Login with Fiberplane</button>
+      <div id="status"></div>
     </div>
     <script type="module">
-      import { createAuthClient } from "https://esm.sh/better-auth@1.2.12/client";
-      import { genericOAuthClient } from "https://esm.sh/better-auth@1.2.12/client/plugins";
-
-      const authClient = createAuthClient({
-        plugins: [
-          genericOAuthClient({
-            providerId: "fp-auth",
-          })
-        ]
-      });
-
-      window.startLogin = async () => {
+      const baseUrl = "${baseUrl}";
+      
+      // Function to show status messages
+      function showStatus(message, isError = false) {
+        const statusDiv = document.getElementById('status');
+        statusDiv.innerHTML = message;
+        statusDiv.className = isError ? 'error' : 'loading';
+      }
+      
+      // Function to redirect to OAuth provider
+      async function redirectToOAuth() {
         try {
-          const data = await authClient.signIn.oauth2({
-            providerId: "fp-auth",
-          });
-          console.log("OAuth flow complete:", data);
+          showStatus('Redirecting to Fiberplane...');
+          
+          // Get OAuth metadata first
+          const metadataResponse = await fetch('${baseUrl}/.well-known/oauth-authorization-server');
+          if (!metadataResponse.ok) {
+            throw new Error('Failed to get OAuth metadata');
+          }
+          
+          const metadata = await metadataResponse.json();
+          console.log('OAuth metadata:', metadata);
+          
+          // Build OAuth authorization URL
+          const authUrl = new URL(metadata.authorization_endpoint || '${baseUrl}/api/auth/oauth2/authorize/fp-auth');
+          authUrl.searchParams.set('client_id', 'your-client-id'); // This should come from environment
+          authUrl.searchParams.set('response_type', 'code');
+          authUrl.searchParams.set('redirect_uri', '${baseUrl}/api/auth/callback/fp-auth');
+          authUrl.searchParams.set('scope', 'openid profile email');
+          authUrl.searchParams.set('state', Math.random().toString(36).substring(7));
+          
+          console.log('Redirecting to:', authUrl.toString());
+          window.location.href = authUrl.toString();
+          
         } catch (error) {
-          console.error("Login failed:", error);
+          console.error('OAuth redirect failed:', error);
+          showStatus('Login failed: ' + error.message, true);
         }
-      };
+      }
+      
+      // Try to import better-auth client, fallback to direct OAuth if it fails
+      async function initializeAuth() {
+        try {
+          // Try to load better-auth client
+          const { createAuthClient } = await import("https://esm.sh/better-auth@1.3.3/client");
+          const { genericOAuthClient } = await import("https://esm.sh/better-auth@1.3.3/client/plugins");
+
+          const authClient = createAuthClient({
+            baseURL: baseUrl,
+            plugins: [
+              genericOAuthClient({
+                providerId: "fp-auth",
+              })
+            ]
+          });
+
+          window.startLogin = async () => {
+            try {
+              showStatus('Starting login...');
+              const data = await authClient.signIn.oauth2({
+                providerId: "fp-auth",
+                callbackURL: '${baseUrl}/api/auth/callback/fp-auth'
+              });
+              console.log("OAuth flow complete:", data);
+              showStatus('Login successful!');
+            } catch (error) {
+              console.error("Better-auth login failed:", error);
+              showStatus('Trying alternative login method...');
+              // Fallback to direct OAuth
+              await redirectToOAuth();
+            }
+          };
+          
+        } catch (error) {
+          console.error("Failed to load better-auth client:", error);
+          // Fallback to direct OAuth redirect
+          window.startLogin = redirectToOAuth;
+        }
+      }
+      
+      // Initialize auth when page loads
+      initializeAuth().catch(error => {
+        console.error("Auth initialization failed:", error);
+        window.startLogin = redirectToOAuth;
+      });
     </script>
   </body>
 </html>
