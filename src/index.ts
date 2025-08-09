@@ -2,11 +2,6 @@ import { createHonoMiddleware } from "@fiberplane/hono";
 import { drizzle } from "drizzle-orm/d1";
 import { Hono } from "hono";
 import { html } from "hono/html";
-import { createMiddleware } from "hono/factory";
-import { betterAuth } from "better-auth";
-import { drizzleAdapter } from "better-auth/adapters/drizzle";
-import { createAuthMiddleware, genericOAuth, mcp as mcpAuthPlugin, type BetterAuthPlugin } from "better-auth/plugins";
-import { oAuthDiscoveryMetadata } from "better-auth/plugins";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import { z } from "zod";
@@ -18,11 +13,6 @@ import * as schema from "./db/schema";
 type Bindings = {
   DB: D1Database;
   KV: KVNamespace;
-  FP_AUTH_ISSUER: string;
-  FP_CLIENT_ID: string;
-  FP_CLIENT_SECRET: string;
-  BETTER_AUTH_URL: string;
-  BETTER_AUTH_SECRET: string;
   OPENAI_API_KEY: string;
   GOOGLE_CLIENT_ID: string;
   GOOGLE_CLIENT_SECRET: string;
@@ -30,173 +20,131 @@ type Bindings = {
   SPOTIFY_CLIENT_SECRET: string;
   CLICKUP_CLIENT_ID: string;
   CLICKUP_CLIENT_SECRET: string;
+  MCP_API_KEY: string;
+  BASE_URL: string;
 };
 
-// Create Better Auth instance
-const createAuth = (env: Bindings) => {
-  const db = drizzle(env.DB);
+const app = new Hono<{ Bindings: Bindings }>();
 
-  return betterAuth({
-    database: drizzleAdapter(db, {
-      provider: "sqlite",
-      schema,
-    }),
-    plugins: [
-      genericOAuth({
-        config: [
-          {
-            providerId: "fp-auth",
-            clientId: env.FP_CLIENT_ID,
-            clientSecret: env.FP_CLIENT_SECRET,
-            discoveryUrl: `${env.FP_AUTH_ISSUER}/.well-known/oauth-authorization-server`,
-            scopes: ["openid", "profile", "email"],
-            pkce: true,
-            responseType: "code",
-            getUserInfo: async (accessToken) => {
-              const response = await fetch(`${env.FP_AUTH_ISSUER}/userinfo`, {
-                headers: {
-                  Authorization: `Bearer ${accessToken.accessToken}`,
-                },
-              });
-              const userInfo = (await response.json()) as {
-                githubUserId?: string;
-                login?: string;
-                email?: string;
-              };
-              return {
-                id: userInfo?.githubUserId || "",
-                name: userInfo?.login || "",
-                email: userInfo?.email || "",
-                emailVerified: true,
-                createdAt: new Date(),
-                updatedAt: new Date(),
-              };
-            },
-          },
-        ],
-      }),
-      mcpAuthPlugin({
-        loginPage: "/login",
-      }),
-      {
-        id: "fp-mcp-fix",
-        hooks: {
-          after: [{
-            matcher: () => true,
-            handler: createAuthMiddleware(async (ctx) => {
-              if (ctx.path === '/oauth2/callback/:providerId') {
-                const responseRedirectLocation = ctx.context.responseHeaders?.get('location');
-                if (!responseRedirectLocation) {
-                  return;
-                }
-
-                const responseReturned = ctx.context.returned;
-                const isMcpAuthBuggyResponse = responseReturned && typeof responseReturned === 'object';
-                if (!isMcpAuthBuggyResponse) {
-                  return;
-                }
-                const redirect = "redirect" in responseReturned && responseReturned.redirect;
-                const responseReturnedLocation = "url" in responseReturned && responseReturned.url;
-                try {
-                  if (redirect && responseRedirectLocation === responseReturnedLocation) {
-                    ctx.context.returned = undefined;
-                    throw ctx.redirect(responseRedirectLocation);
-                  }
-                } catch {
-                  return;
-                }
-              }
-              return;
-            }),
-          }],
-        },
-      } satisfies BetterAuthPlugin,
-    ],
-    emailAndPassword: {
-      enabled: false,
-    },
-    baseURL: env.BETTER_AUTH_URL,
-    secret: env.BETTER_AUTH_SECRET,
-  });
-};
-
-// MCP authentication middleware
-const mcpAuthMiddleware = createMiddleware<{
-  Bindings: Bindings;
-}>(async (c, next) => {
-  const auth = createAuth(c.env);
-  const url = new URL(c.req.raw.url);
-  const baseUrl = `${url.protocol}//${url.host}`;
-  const wwwAuthenticateValue = `Bearer resource_metadata=${baseUrl}/api/auth/.well-known/oauth-authorization-server`;
-
-  const session = await auth.api.getMcpSession({
-    headers: c.req.raw.headers,
-  });
-
-  if (!session) {
-    return c.json(
-      {
-        jsonrpc: "2.0",
-        error: {
-          code: -32000,
-          message: "Unauthorized: Authentication required",
-          "www-authenticate": wwwAuthenticateValue,
-        },
-        id: null,
-      },
-      {
-        status: 401,
-        headers: {
-          "WWW-Authenticate": wwwAuthenticateValue,
-        },
-      },
-    );
-  }
-  return next();
-});
-
-// OAuth token encryption/decryption helpers
-async function encryptToken(token: string, secret: string): Promise<string> {
+// Utility functions
+async function hashToken(token: string): Promise<string> {
   const encoder = new TextEncoder();
   const data = encoder.encode(token);
-  const key = await crypto.subtle.importKey(
-    "raw",
-    encoder.encode(secret.slice(0, 32)),
-    { name: "AES-GCM" },
-    false,
-    ["encrypt"]
-  );
-  const iv = crypto.getRandomValues(new Uint8Array(12));
-  const encrypted = await crypto.subtle.encrypt(
-    { name: "AES-GCM", iv },
-    key,
-    data
-  );
-  const result = new Uint8Array(iv.length + encrypted.byteLength);
-  result.set(iv);
-  result.set(new Uint8Array(encrypted), iv.length);
-  return btoa(String.fromCharCode(...result));
+  const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-async function decryptToken(encryptedToken: string, secret: string): Promise<string> {
-  const encoder = new TextEncoder();
-  const decoder = new TextDecoder();
-  const data = new Uint8Array(atob(encryptedToken).split('').map(c => c.charCodeAt(0)));
-  const key = await crypto.subtle.importKey(
-    "raw",
-    encoder.encode(secret.slice(0, 32)),
-    { name: "AES-GCM" },
-    false,
-    ["decrypt"]
-  );
-  const iv = data.slice(0, 12);
-  const encrypted = data.slice(12);
-  const decrypted = await crypto.subtle.decrypt(
-    { name: "AES-GCM", iv },
-    key,
-    encrypted
-  );
-  return decoder.decode(decrypted);
+async function storeToken(kv: KVNamespace, hash: string, token: string): Promise<void> {
+  await kv.put(`token:${hash}`, token, { expirationTtl: 86400 * 30 }); // 30 days
+}
+
+async function getToken(kv: KVNamespace, hash: string): Promise<string | null> {
+  return await kv.get(`token:${hash}`);
+}
+
+async function getUserSession(kv: KVNamespace, sessionId: string): Promise<any> {
+  const session = await kv.get(`session:${sessionId}`);
+  return session ? JSON.parse(session) : null;
+}
+
+async function createUserSession(kv: KVNamespace, userId: string): Promise<string> {
+  const sessionId = crypto.randomUUID();
+  const session = { userId, createdAt: Date.now() };
+  await kv.put(`session:${sessionId}`, JSON.stringify(session), { expirationTtl: 86400 * 7 }); // 7 days
+  return sessionId;
+}
+
+// MCP Authentication middleware
+async function mcpAuthMiddleware(c: any, next: any) {
+  const authHeader = c.req.header('Authorization');
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return c.json({ error: 'Unauthorized' }, 401);
+  }
+  
+  const token = authHeader.substring(7);
+  if (token !== c.env.MCP_API_KEY) {
+    return c.json({ error: 'Invalid API key' }, 401);
+  }
+  
+  await next();
+}
+
+// OAuth helper functions
+async function exchangeCodeForTokens(provider: string, code: string, env: Bindings, baseUrl: string): Promise<any> {
+  const configs = {
+    google: {
+      tokenUrl: 'https://oauth2.googleapis.com/token',
+      clientId: env.GOOGLE_CLIENT_ID,
+      clientSecret: env.GOOGLE_CLIENT_SECRET,
+    },
+    spotify: {
+      tokenUrl: 'https://accounts.spotify.com/api/token',
+      clientId: env.SPOTIFY_CLIENT_ID,
+      clientSecret: env.SPOTIFY_CLIENT_SECRET,
+    },
+    clickup: {
+      tokenUrl: 'https://api.clickup.com/api/v2/oauth/token',
+      clientId: env.CLICKUP_CLIENT_ID,
+      clientSecret: env.CLICKUP_CLIENT_SECRET,
+    }
+  };
+
+  const config = configs[provider as keyof typeof configs];
+  if (!config) throw new Error('Invalid provider');
+
+  const redirectUri = `${baseUrl}/oauth/callback/${provider}`;
+  
+  console.log('Token exchange request:', {
+    provider,
+    tokenUrl: config.tokenUrl,
+    redirectUri,
+    hasClientId: !!config.clientId,
+    hasClientSecret: !!config.clientSecret,
+    codeLength: code.length
+  });
+
+  const response = await fetch(config.tokenUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Authorization': `Basic ${btoa(`${config.clientId}:${config.clientSecret}`)}`,
+    },
+    body: new URLSearchParams({
+      grant_type: 'authorization_code',
+      code,
+      redirect_uri: redirectUri,
+    }),
+  });
+
+  const responseText = await response.text();
+  console.log('Token exchange response:', {
+    status: response.status,
+    statusText: response.statusText,
+    responseText: responseText.substring(0, 500) // Limit log size
+  });
+
+  if (!response.ok) {
+    throw new Error(`Token exchange failed: ${response.status} ${response.statusText} - ${responseText}`);
+  }
+
+  try {
+    return JSON.parse(responseText);
+  } catch (parseError) {
+    console.error('Failed to parse token response:', parseError);
+    throw new Error(`Invalid JSON response: ${responseText}`);
+  }
+}
+
+// OAuth token storage helpers (using hashed tokens instead of encryption)
+async function storeOAuthToken(kv: KVNamespace, token: string): Promise<string> {
+  const hash = await hashToken(token);
+  await storeToken(kv, hash, token);
+  return hash;
+}
+
+async function getOAuthToken(kv: KVNamespace, hash: string): Promise<string | null> {
+  return await getToken(kv, hash);
 }
 
 // External API helpers
@@ -348,7 +296,16 @@ function createMcpServer(env: Bindings, headers?: Headers) {
           };
         }
 
-        const accessToken = await decryptToken(googleConnection.accessTokenHash, env.BETTER_AUTH_SECRET);
+        const accessToken = await getOAuthToken(env.KV, googleConnection.accessTokenHash);
+        if (!accessToken) {
+          return {
+            content: [{
+              type: "text",
+              text: "Failed to retrieve Google Calendar access token"
+            }],
+            isError: true
+          };
+        }
         const [startDate, endDate] = date_range.split('/');
         
         const events = await getGoogleCalendarEvents(
@@ -652,29 +609,25 @@ function createMcpServer(env: Bindings, headers?: Headers) {
   return server;
 }
 
-const app = new Hono<{ Bindings: Bindings }>();
-
-// OAuth discovery endpoints
-app.get("/.well-known/oauth-authorization-server", async (c) => {
-  const auth = createAuth(c.env);
-  const metadataResponse = oAuthDiscoveryMetadata(auth)(c.req.raw);
-  return metadataResponse;
-});
-
-app.get("/.well-known/oauth-protected-resource", async (c) => {
-  const requestUrl = new URL(c.req.url);
-  const resourceUrl = `${requestUrl.protocol}//${requestUrl.host}`;
-  const authServerIssuer = resourceUrl;
-
-  const metadata = {
-    resource: resourceUrl,
-    authorization_servers: [authServerIssuer],
-    scopes_supported: ["openid", "profile", "email"],
-    bearer_methods_supported: ["header"],
-    resource_name: "Vibe Summer Concierge MCP Server",
-  };
-
-  return c.json(metadata);
+// Routes
+app.get("/", (c) => {
+  return c.html(html`
+    <html>
+      <head>
+        <title>Vibe Summer Concierge</title>
+      </head>
+      <body>
+        <h1>Vibe Summer Concierge MCP Server</h1>
+        <p>Intelligent calendar management, focus music, and AI-powered task synthesis.</p>
+        <ul>
+          <li><a href="/login">Login</a></li>
+          <li><a href="/oauth/connect/google">Connect Google Calendar</a></li>
+          <li><a href="/oauth/connect/spotify">Connect Spotify</a></li>
+          <li><a href="/oauth/connect/clickup">Connect ClickUp</a></li>
+        </ul>
+      </body>
+    </html>
+  `);
 });
 
 // Debug endpoint to check configuration
@@ -683,10 +636,29 @@ app.get("/debug/auth", async (c) => {
     hasClientId: !!c.env.FP_CLIENT_ID,
     hasClientSecret: !!c.env.FP_CLIENT_SECRET,
     hasAuthIssuer: !!c.env.FP_AUTH_ISSUER,
-    hasBetterAuthUrl: !!c.env.BETTER_AUTH_URL,
-    hasBetterAuthSecret: !!c.env.BETTER_AUTH_SECRET,
-    baseUrl: c.env.BETTER_AUTH_URL,
+    hasMcpApiKey: !!c.env.MCP_API_KEY,
+    hasBaseUrl: !!c.env.BASE_URL,
+    baseUrl: c.env.BASE_URL,
     issuer: c.env.FP_AUTH_ISSUER,
+  });
+});
+
+app.get("/debug/oauth", async (c) => {
+  return c.json({
+    google: {
+      hasClientId: !!c.env.GOOGLE_CLIENT_ID,
+      hasClientSecret: !!c.env.GOOGLE_CLIENT_SECRET,
+      clientIdLength: c.env.GOOGLE_CLIENT_ID?.length || 0,
+      clientSecretLength: c.env.GOOGLE_CLIENT_SECRET?.length || 0
+    },
+    spotify: {
+      hasClientId: !!c.env.SPOTIFY_CLIENT_ID,
+      hasClientSecret: !!c.env.SPOTIFY_CLIENT_SECRET,
+    },
+    clickup: {
+      hasClientId: !!c.env.CLICKUP_CLIENT_ID,
+      hasClientSecret: !!c.env.CLICKUP_CLIENT_SECRET,
+    }
   });
 });
 
@@ -712,154 +684,368 @@ app.get("/debug/auth-routes", async (c) => {
   }
 });
 
+// Session middleware helper
+async function getSession(c: any) {
+  const cookies = c.req.header('cookie') || '';
+  const sessionMatch = cookies.match(/session=([^;]+)/);
+  
+  if (!sessionMatch) return null;
+  
+  const sessionId = sessionMatch[1];
+  const sessionData = await c.env.KV.get(`session_${sessionId}`);
+  
+  if (!sessionData) return null;
+  
+  try {
+    const session = JSON.parse(sessionData);
+    // Check if session is expired
+    if (session.expiresAt < Date.now()) {
+      await c.env.KV.delete(`session_${sessionId}`);
+      return null;
+    }
+    return session;
+  } catch {
+    return null;
+  }
+}
+
+// Direct OAuth callback handler
+app.get("/auth/callback", async (c) => {
+  const code = c.req.query('code');
+  const state = c.req.query('state');
+  const error = c.req.query('error');
+
+  if (error) {
+    return c.html(`<h1>Authentication Error</h1><p>Error: ${error}</p><a href="/login">Try Again</a>`);
+  }
+
+  if (!code || !state) {
+    return c.html(`<h1>Authentication Error</h1><p>Missing authorization code or state</p><a href="/login">Try Again</a>`);
+  }
+
+  try {
+    // Validate state parameter
+    const storedState = await c.env.KV.get(`oauth_state_${state}`);
+    if (!storedState) {
+      return c.html(`<h1>Authentication Error</h1><p>Invalid or expired state parameter</p><a href="/login">Try Again</a>`);
+    }
+
+    // Clean up state
+    await c.env.KV.delete(`oauth_state_${state}`);
+
+    // Exchange code for tokens
+    const tokenResponse = await fetch(`${c.env.FP_AUTH_ISSUER}/oauth/token`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        code: code,
+        client_id: c.env.FP_CLIENT_ID,
+        client_secret: c.env.FP_CLIENT_SECRET,
+        redirect_uri: `${new URL(c.req.url).origin}/auth/callback`,
+      }),
+    });
+
+    if (!tokenResponse.ok) {
+      const errorText = await tokenResponse.text();
+      return c.html(`<h1>Token Exchange Error</h1><p>Failed to exchange code for tokens: ${errorText}</p><a href="/login">Try Again</a>`);
+    }
+
+    const tokens = await tokenResponse.json() as {
+      access_token: string;
+      id_token?: string;
+      refresh_token?: string;
+      expires_in?: number;
+    };
+
+    // Get user info
+    const userResponse = await fetch(`${c.env.FP_AUTH_ISSUER}/userinfo`, {
+      headers: {
+        'Authorization': `Bearer ${tokens.access_token}`,
+      },
+    });
+
+    if (!userResponse.ok) {
+      return c.html(`<h1>User Info Error</h1><p>Failed to get user information</p><a href="/login">Try Again</a>`);
+    }
+
+    const userInfo = await userResponse.json() as {
+      sub: string;
+      email?: string;
+      name?: string;
+      login?: string;
+      githubUserId?: string;
+    };
+
+    // Create session token (simple JWT-like structure)
+    const sessionData = {
+      userId: userInfo.sub || userInfo.githubUserId || 'unknown',
+      email: userInfo.email,
+      name: userInfo.name || userInfo.login,
+      accessToken: tokens.access_token,
+      createdAt: Date.now(),
+      expiresAt: Date.now() + (tokens.expires_in || 3600) * 1000,
+    };
+
+    // Store session in KV (expires in 24 hours)
+    const sessionId = crypto.randomUUID();
+    await c.env.KV.put(`session_${sessionId}`, JSON.stringify(sessionData), { expirationTtl: 86400 });
+
+    // Set session cookie and redirect to dashboard
+    c.header('Set-Cookie', `session=${sessionId}; HttpOnly; Secure; SameSite=Strict; Max-Age=86400; Path=/`);
+    return c.redirect('/dashboard');
+
+  } catch (error) {
+    console.error('OAuth callback error:', error);
+    return c.html(`<h1>Authentication Error</h1><p>An unexpected error occurred: ${error instanceof Error ? error.message : 'Unknown error'}</p><a href="/login">Try Again</a>`);
+  }
+});
+
 // Authentication routes
-app.get("/login", async (c) => {
+app.get("/login", (c) => {
+  return c.html(html`
+    <html>
+      <head>
+        <title>Login - Vibe Summer Concierge</title>
+      </head>
+      <body>
+        <h1>Login</h1>
+        <p>Use your MCP API key to authenticate.</p>
+        <form method="post" action="/auth/login">
+          <input type="password" name="api_key" placeholder="MCP API Key" required />
+          <button type="submit">Login</button>
+        </form>
+      </body>
+    </html>
+  `);
+});
+
+app.post("/auth/login", async (c) => {
+  const formData = await c.req.formData();
+  const apiKey = formData.get("api_key") as string;
+  
+  if (apiKey === c.env.MCP_API_KEY) {
+    const sessionId = await createUserSession(c.env.KV, "default-user");
+    c.header("Set-Cookie", `session=${sessionId}; HttpOnly; Secure; SameSite=Strict; Max-Age=604800`);
+    return c.redirect("/");
+  }
+  
+  return c.html(html`
+    <html>
+      <body>
+        <h1>Login Failed</h1>
+        <p>Invalid API key. <a href="/login">Try again</a></p>
+      </body>
+    </html>
+  `);
+});
+
+app.get("/oauth/connect/:provider", async (c) => {
+  const provider = c.req.param("provider");
+  
+  // Get base URL from request
   const requestUrl = new URL(c.req.url);
   const baseUrl = `${requestUrl.protocol}//${requestUrl.host}`;
+  
+  const configs = {
+    google: {
+      authUrl: "https://accounts.google.com/o/oauth2/v2/auth",
+      clientId: c.env.GOOGLE_CLIENT_ID,
+      scopes: "https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/calendar.events"
+    },
+    spotify: {
+      authUrl: "https://accounts.spotify.com/authorize",
+      clientId: c.env.SPOTIFY_CLIENT_ID,
+      scopes: "user-read-playback-state user-modify-playback-state playlist-read-private"
+    },
+    clickup: {
+      authUrl: "https://app.clickup.com/api",
+      clientId: c.env.CLICKUP_CLIENT_ID,
+      scopes: "task:write space:read project:read"
+    }
+  };
+
+  const config = configs[provider as keyof typeof configs];
+  if (!config) {
+    return c.json({ error: "Invalid provider" }, 400);
+  }
+
+  const state = crypto.randomUUID();
+  await c.env.KV.put(`oauth_state:${state}`, provider, { expirationTtl: 600 });
+
+  const authUrl = new URL(config.authUrl);
+  authUrl.searchParams.set("client_id", config.clientId);
+  authUrl.searchParams.set("redirect_uri", `${baseUrl}/oauth/callback/${provider}`);
+  authUrl.searchParams.set("scope", config.scopes);
+  authUrl.searchParams.set("response_type", "code");
+  authUrl.searchParams.set("state", state);
+
+  return c.redirect(authUrl.toString());
+});
+
+app.get("/oauth/callback/:provider", async (c) => {
+  const provider = c.req.param("provider");
+  const code = c.req.query("code");
+  const state = c.req.query("state");
+
+  if (!code || !state) {
+    return c.json({ error: "Missing code or state" }, 400);
+  }
+
+  const storedProvider = await c.env.KV.get(`oauth_state:${state}`);
+  if (storedProvider !== provider) {
+    return c.json({ error: "Invalid state" }, 400);
+  }
+
+  try {
+    // Get base URL from request
+    const requestUrl = new URL(c.req.url);
+    const baseUrl = `${requestUrl.protocol}//${requestUrl.host}`;
+    
+    const tokens = await exchangeCodeForTokens(provider, code, c.env, baseUrl);
+    
+    // Add debugging
+    console.log('OAuth tokens received:', { 
+      hasAccessToken: !!tokens.access_token,
+      hasRefreshToken: !!tokens.refresh_token,
+      error: tokens.error,
+      tokenResponse: tokens
+    });
+    
+    if (tokens.access_token) {
+      try {
+        const db = drizzle(c.env.DB);
+        
+        // Ensure default user exists
+        const defaultUserId = "default-user";
+        const existingUser = await db.select().from(schema.user).where(eq(schema.user.id, defaultUserId)).limit(1);
+        
+        if (existingUser.length === 0) {
+          // Create default user if it doesn't exist
+          await db.insert(schema.user).values({
+            id: defaultUserId,
+            name: "Default User",
+            email: "default@vibe-summer-concierge.local",
+            emailVerified: true,
+            timezone: "UTC"
+          });
+        }
+        
+        const accessTokenHash = await hashToken(tokens.access_token);
+        const refreshTokenHash = tokens.refresh_token ? await hashToken(tokens.refresh_token) : null;
+
+        await storeToken(c.env.KV, accessTokenHash, tokens.access_token);
+        if (tokens.refresh_token && refreshTokenHash) {
+          await storeToken(c.env.KV, refreshTokenHash, tokens.refresh_token);
+        }
+
+        // Prepare the data for insertion
+        const connectionData = {
+          userId: defaultUserId,
+          provider: provider as "google" | "spotify" | "clickup",
+          providerUserId: "unknown", // Would get from provider's user info endpoint
+          accessTokenHash,
+          refreshTokenHash,
+          expiresAt: tokens.expires_in ? new Date(Date.now() + tokens.expires_in * 1000) : null,
+          scopes: tokens.scope ? tokens.scope.split(" ") : []
+        };
+
+        console.log('Inserting OAuth connection:', connectionData);
+
+        // Check for existing connection and update or insert
+        const existingConnection = await db.select()
+          .from(schema.oauthConnections)
+          .where(
+            and(
+              eq(schema.oauthConnections.userId, defaultUserId),
+              eq(schema.oauthConnections.provider, provider as "google" | "spotify" | "clickup")
+            )
+          )
+          .limit(1);
+
+        if (existingConnection.length > 0) {
+          // Update existing connection
+          await db.update(schema.oauthConnections)
+            .set({
+              accessTokenHash,
+              refreshTokenHash,
+              expiresAt: connectionData.expiresAt,
+              scopes: connectionData.scopes,
+              updatedAt: new Date()
+            })
+            .where(eq(schema.oauthConnections.id, existingConnection[0].id));
+        } else {
+          // Insert new connection
+          await db.insert(schema.oauthConnections).values(connectionData);
+        }
+
+        return c.html(html`
+          <html>
+            <body>
+              <h1>Connected to ${provider}</h1>
+              <p>Successfully connected your ${provider} account!</p>
+              <a href="/">Back to home</a>
+            </body>
+          </html>
+        `);
+      } catch (dbError) {
+        console.error('Database insertion error:', dbError);
+        return c.json({ 
+          error: "Database error while saving OAuth connection", 
+          details: dbError instanceof Error ? dbError.message : 'Unknown database error',
+          provider 
+        }, 500);
+      }
+    }
+
+    return c.json({ 
+      error: "Failed to get access token", 
+      details: tokens,
+      provider,
+      code: code?.substring(0, 10) + "..."
+    }, 400);
+  } catch (error) {
+    console.error('OAuth callback error:', error);
+    return c.json({ 
+      error: "OAuth callback failed", 
+      details: error instanceof Error ? error.message : 'Unknown error',
+      provider 
+    }, 500);
+  }
+});
+
+app.get("/logout", async (c) => {
+  // Get session from cookie
+  const cookies = c.req.header('cookie') || '';
+  const sessionMatch = cookies.match(/session=([^;]+)/);
+  
+  if (sessionMatch) {
+    const sessionId = sessionMatch[1];
+    // Delete session from KV
+    await c.env.KV.delete(`session_${sessionId}`);
+  }
+  
+  // Clear session cookie
+  c.header('Set-Cookie', 'session=; HttpOnly; Secure; SameSite=Strict; Max-Age=0; Path=/');
   
   return c.html(
     html`
 <html lang="en">
   <head>
-    <title>Login | Vibe Summer Concierge</title>
+    <title>Logged Out | Vibe Summer Concierge</title>
     <meta charSet="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <style>
-      body { font-family: system-ui, sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; }
-      .login-container { text-align: center; }
-      .btn { background: #007bff; color: white; padding: 12px 24px; border: none; border-radius: 6px; cursor: pointer; font-size: 16px; text-decoration: none; display: inline-block; }
-      .btn:hover { background: #0056b3; }
-      .error { color: red; margin-top: 10px; }
-      .loading { color: #666; margin-top: 10px; }
+      body { font-family: system-ui, sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; text-align: center; }
+      .btn { background: #007bff; color: white; padding: 12px 24px; border: none; border-radius: 6px; text-decoration: none; display: inline-block; }
     </style>
   </head>
   <body>
-    <div class="login-container">
-      <h1>Vibe Summer Concierge</h1>
-      <p>Intelligent calendar management, focus music, and AI-powered task synthesis</p>
-      <button class="btn" onclick="startLogin()" id="loginBtn">Login with Fiberplane</button>
-      <div id="status"></div>
-    </div>
-    <script type="module">
-      const baseUrl = "${baseUrl}";
-      
-      // Function to show status messages
-      function showStatus(message, isError = false) {
-        const statusDiv = document.getElementById('status');
-        statusDiv.innerHTML = message;
-        statusDiv.className = isError ? 'error' : 'loading';
-      }
-      
-      // Function to redirect to OAuth provider
-      async function redirectToOAuth() {
-        try {
-          showStatus('Redirecting to Fiberplane...');
-          
-          // Get OAuth metadata first
-          const metadataResponse = await fetch('${baseUrl}/.well-known/oauth-authorization-server');
-          if (!metadataResponse.ok) {
-            throw new Error('Failed to get OAuth metadata');
-          }
-          
-          const metadata = await metadataResponse.json();
-          console.log('OAuth metadata:', metadata);
-          
-          // Build OAuth authorization URL
-          const authUrl = new URL(metadata.authorization_endpoint || '${baseUrl}/api/auth/oauth2/authorize/fp-auth');
-          authUrl.searchParams.set('client_id', 'your-client-id'); // This should come from environment
-          authUrl.searchParams.set('response_type', 'code');
-          authUrl.searchParams.set('redirect_uri', '${baseUrl}/api/auth/callback/fp-auth');
-          authUrl.searchParams.set('scope', 'openid profile email');
-          authUrl.searchParams.set('state', Math.random().toString(36).substring(7));
-          
-          console.log('Redirecting to:', authUrl.toString());
-          window.location.href = authUrl.toString();
-          
-        } catch (error) {
-          console.error('OAuth redirect failed:', error);
-          showStatus('Login failed: ' + error.message, true);
-        }
-      }
-      
-      // Try to import better-auth client, fallback to direct OAuth if it fails
-      async function initializeAuth() {
-        try {
-          // Try to load better-auth client
-          const { createAuthClient } = await import("https://esm.sh/better-auth@1.3.3/client");
-          const { genericOAuthClient } = await import("https://esm.sh/better-auth@1.3.3/client/plugins");
-
-          const authClient = createAuthClient({
-            baseURL: baseUrl,
-            plugins: [
-              genericOAuthClient({
-                providerId: "fp-auth",
-              })
-            ]
-          });
-
-      window.startLogin = async () => {
-        try {
-          showStatus('Starting login...');
-          
-          // Use Better Auth's direct OAuth endpoint
-          const oauthUrl = '${baseUrl}/api/auth/sign-in/oauth2';
-          const params = new URLSearchParams({
-            providerId: 'fp-auth',
-            callbackURL: '${baseUrl}/',
-          });
-          
-          window.location.href = \`\${oauthUrl}?\${params.toString()}\`;
-          
-        } catch (error) {
-          console.error("Login failed:", error);
-          showStatus('Login failed: ' + error.message, true);
-          // Fallback to direct OAuth
-          await redirectToOAuth();
-        }
-      };        } catch (error) {
-          console.error("Failed to load better-auth client:", error);
-          // Fallback to direct OAuth redirect
-          window.startLogin = redirectToOAuth;
-        }
-      }
-      
-      // Initialize auth when page loads
-      initializeAuth().catch(error => {
-        console.error("Auth initialization failed:", error);
-        window.startLogin = redirectToOAuth;
-      });
-    </script>
-  </body>
-</html>
-`
-  );
-});
-
-app.get("/logout", async (c) => {
-  return c.html(
-    html`
-<html lang="en">
-  <head>
-    <title>Logout | Vibe Summer Concierge</title>
-    <meta charSet="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-  </head>
-  <body>
-    <script type="module">
-      import { createAuthClient } from "https://esm.sh/better-auth@1.2.12/client";
-      import { genericOAuthClient } from "https://esm.sh/better-auth@1.2.12/client/plugins";
-
-      const authClient = createAuthClient({
-        plugins: [
-          genericOAuthClient({
-            providerId: "fp-auth",
-          })
-        ]
-      });
-
-      const data = await authClient.signOut();
-      document.body.innerHTML = "<h1>Logged out successfully</h1>";
-    </script>
+    <h1>👋 Successfully Logged Out</h1>
+    <p>You have been safely logged out of Vibe Summer Concierge.</p>
+    <a href="/login" class="btn">🔐 Login Again</a>
   </body>
 </html>
 `
@@ -868,12 +1054,9 @@ app.get("/logout", async (c) => {
 
 // Dashboard route
 app.get("/dashboard", async (c) => {
-  const auth = createAuth(c.env);
-  const session = await auth.api.getSession({
-    headers: c.req.raw.headers,
-  });
+  const session = await getSession(c);
 
-  if (!session?.user) {
+  if (!session) {
     return c.redirect("/login");
   }
 
@@ -888,34 +1071,60 @@ app.get("/dashboard", async (c) => {
       body { font-family: system-ui, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
       .header { text-align: center; margin-bottom: 40px; }
       .user-info { background: #f8f9fa; padding: 20px; border-radius: 8px; margin-bottom: 30px; }
-      .btn { background: #007bff; color: white; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; text-decoration: none; }
+      .btn { background: #007bff; color: white; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; text-decoration: none; margin: 5px; }
+      .btn.danger { background: #dc3545; }
+      .section { margin: 30px 0; }
+      .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; }
+      .card { background: white; border: 1px solid #dee2e6; border-radius: 8px; padding: 20px; }
     </style>
   </head>
   <body>
     <div class="header">
-      <h1>Welcome to Vibe Summer Concierge</h1>
+      <h1>🎵 Vibe Summer Concierge Dashboard</h1>
+      <p>Welcome back! Your intelligent productivity companion is ready.</p>
     </div>
     
     <div class="user-info">
-      <h3>User Information</h3>
-      <p><strong>ID:</strong> ${session.user.id}</p>
-      <p><strong>Name:</strong> ${session.user.name || 'Not provided'}</p>
-      <p><strong>Email:</strong> ${session.user.email || 'Not provided'}</p>
+      <h3>👤 User Information</h3>
+      <p><strong>ID:</strong> ${session.userId}</p>
+      <p><strong>Name:</strong> ${session.name || 'Not provided'}</p>
+      <p><strong>Email:</strong> ${session.email || 'Not provided'}</p>
+      <p><strong>Session expires:</strong> ${new Date(session.expiresAt).toLocaleString()}</p>
     </div>
     
-    <div>
-      <h3>Available Endpoints</h3>
-      <ul>
-        <li><a href="/api/user/profile">User Profile API</a></li>
-        <li><a href="/api/user/connections">OAuth Connections</a></li>
-        <li><a href="/docs">API Documentation</a></li>
-        <li><a href="/openapi.json">OpenAPI Specification</a></li>
-        <li><a href="/mcp">MCP Server</a></li>
-      </ul>
+    <div class="grid">
+      <div class="card">
+        <h3>📊 API Endpoints</h3>
+        <ul>
+          <li><a href="/api/user/profile">User Profile API</a></li>
+          <li><a href="/api/user/connections">OAuth Connections</a></li>
+          <li><a href="/api/user/music-sessions">Music Sessions</a></li>
+          <li><a href="/api/user/task-history">Task History</a></li>
+        </ul>
+      </div>
+      
+      <div class="card">
+        <h3>📚 Documentation</h3>
+        <ul>
+          <li><a href="/docs">Interactive API Docs</a></li>
+          <li><a href="/openapi.json">OpenAPI Specification</a></li>
+          <li><a href="/debug/auth">Auth Configuration</a></li>
+        </ul>
+      </div>
+      
+      <div class="card">
+        <h3>🤖 MCP Integration</h3>
+        <ul>
+          <li><a href="/mcp">MCP Server Endpoint</a></li>
+          <li>Calendar Management Tools</li>
+          <li>Music Focus Sessions</li>
+          <li>AI Task Synthesis</li>
+        </ul>
+      </div>
     </div>
     
-    <div style="margin-top: 30px;">
-      <a href="/logout" class="btn">Logout</a>
+    <div class="section" style="text-align: center;">
+      <a href="/logout" class="btn danger">🚪 Logout</a>
     </div>
   </body>
 </html>
