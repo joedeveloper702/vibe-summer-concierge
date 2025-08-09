@@ -690,6 +690,28 @@ app.get("/debug/auth", async (c) => {
   });
 });
 
+// Test Better Auth routes
+app.get("/debug/auth-routes", async (c) => {
+  const auth = createAuth(c.env);
+  try {
+    // Try to get available endpoints from Better Auth
+    const testRequest = new Request(`${c.env.BETTER_AUTH_URL}/api/auth/`, {
+      method: 'GET',
+    });
+    const response = await auth.handler(testRequest);
+    const text = await response.text();
+    return c.json({ 
+      status: response.status,
+      response: text 
+    });
+  } catch (error) {
+    return c.json({ 
+      error: error instanceof Error ? error.message : 'Unknown error',
+      stack: error instanceof Error ? error.stack : undefined
+    });
+  }
+});
+
 // Authentication routes
 app.get("/login", async (c) => {
   const requestUrl = new URL(c.req.url);
@@ -775,24 +797,26 @@ app.get("/login", async (c) => {
             ]
           });
 
-          window.startLogin = async () => {
-            try {
-              showStatus('Starting login...');
-              const data = await authClient.signIn.oauth2({
-                providerId: "fp-auth",
-                callbackURL: '${baseUrl}/api/auth/callback/fp-auth'
-              });
-              console.log("OAuth flow complete:", data);
-              showStatus('Login successful!');
-            } catch (error) {
-              console.error("Better-auth login failed:", error);
-              showStatus('Trying alternative login method...');
-              // Fallback to direct OAuth
-              await redirectToOAuth();
-            }
-          };
+      window.startLogin = async () => {
+        try {
+          showStatus('Starting login...');
+          
+          // Use Better Auth's direct OAuth endpoint
+          const oauthUrl = '${baseUrl}/api/auth/sign-in/oauth2';
+          const params = new URLSearchParams({
+            providerId: 'fp-auth',
+            callbackURL: '${baseUrl}/',
+          });
+          
+          window.location.href = \`\${oauthUrl}?\${params.toString()}\`;
           
         } catch (error) {
+          console.error("Login failed:", error);
+          showStatus('Login failed: ' + error.message, true);
+          // Fallback to direct OAuth
+          await redirectToOAuth();
+        }
+      };        } catch (error) {
           console.error("Failed to load better-auth client:", error);
           // Fallback to direct OAuth redirect
           window.startLogin = redirectToOAuth;
@@ -842,8 +866,65 @@ app.get("/logout", async (c) => {
   );
 });
 
-// Better Auth routes
-app.on(["POST", "GET"], "/api/auth/**", (c) => {
+// Dashboard route
+app.get("/dashboard", async (c) => {
+  const auth = createAuth(c.env);
+  const session = await auth.api.getSession({
+    headers: c.req.raw.headers,
+  });
+
+  if (!session?.user) {
+    return c.redirect("/login");
+  }
+
+  return c.html(
+    html`
+<html lang="en">
+  <head>
+    <title>Dashboard | Vibe Summer Concierge</title>
+    <meta charSet="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+      body { font-family: system-ui, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; }
+      .header { text-align: center; margin-bottom: 40px; }
+      .user-info { background: #f8f9fa; padding: 20px; border-radius: 8px; margin-bottom: 30px; }
+      .btn { background: #007bff; color: white; padding: 8px 16px; border: none; border-radius: 4px; cursor: pointer; text-decoration: none; }
+    </style>
+  </head>
+  <body>
+    <div class="header">
+      <h1>Welcome to Vibe Summer Concierge</h1>
+    </div>
+    
+    <div class="user-info">
+      <h3>User Information</h3>
+      <p><strong>ID:</strong> ${session.user.id}</p>
+      <p><strong>Name:</strong> ${session.user.name || 'Not provided'}</p>
+      <p><strong>Email:</strong> ${session.user.email || 'Not provided'}</p>
+    </div>
+    
+    <div>
+      <h3>Available Endpoints</h3>
+      <ul>
+        <li><a href="/api/user/profile">User Profile API</a></li>
+        <li><a href="/api/user/connections">OAuth Connections</a></li>
+        <li><a href="/docs">API Documentation</a></li>
+        <li><a href="/openapi.json">OpenAPI Specification</a></li>
+        <li><a href="/mcp">MCP Server</a></li>
+      </ul>
+    </div>
+    
+    <div style="margin-top: 30px;">
+      <a href="/logout" class="btn">Logout</a>
+    </div>
+  </body>
+</html>
+`
+  );
+});
+
+// Better Auth routes - handle all methods
+app.all("/api/auth/*", (c) => {
   const auth = createAuth(c.env);
   return auth.handler(c.req.raw);
 });
