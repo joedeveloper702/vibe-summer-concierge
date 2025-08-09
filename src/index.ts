@@ -228,18 +228,46 @@ async function startSpotifyPlayback(accessToken: string, playlistId: string): Pr
   );
 }
 
-async function createClickUpTask(accessToken: string, spaceId: string, task: { name: string; description?: string; priority?: string }): Promise<ClickUpTask> {
+async function createClickUpTask(accessToken: string, listId: string, task: { name: string; description?: string; priority?: string }): Promise<ClickUpTask> {
+  // ClickUp priority mapping: urgent=1, high=2, normal=3, low=4
+  const priorityMap: { [key: string]: number } = {
+    'urgent': 1,
+    'high': 2,
+    'normal': 3,
+    'low': 4
+  };
+
+  const taskData: any = {
+    name: task.name,
+  };
+
+  if (task.description) {
+    taskData.description = task.description;
+  }
+
+  if (task.priority && priorityMap[task.priority]) {
+    taskData.priority = priorityMap[task.priority];
+  }
+
+  // ClickUp API requires tasks to be created in a list, not a space
   const response = await fetch(
-    `https://api.clickup.com/api/v2/space/${spaceId}/task`,
+    `https://api.clickup.com/api/v2/list/${listId}/task`,
     {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${accessToken}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify(task),
+      body: JSON.stringify(taskData),
     }
   );
+  
+  if (!response.ok) {
+    const errorText = await response.text();
+    console.error(`ClickUp API error (${response.status}):`, errorText);
+    throw new Error(`ClickUp API error: ${response.status} - ${errorText}`);
+  }
+  
   return await response.json() as ClickUpTask;
 }
 
@@ -252,7 +280,6 @@ function createMcpServer(env: Bindings, headers?: Headers) {
   });
 
   const db = drizzle(env.DB);
-  const auth = createAuth(env);
 
   // Calendar management tool
   server.tool(
@@ -268,13 +295,16 @@ function createMcpServer(env: Bindings, headers?: Headers) {
     },
     async ({ action, date_range, preferences }) => {
       try {
-        const userSession = await auth.api.getSession({
-          headers: headers || new Headers(),
-        });
+        // For MCP API key authentication, we'll use the first available user's connections
+        // In a production system, you might want to pass user ID as a parameter
+        const [defaultUser] = await db
+          .select()
+          .from(schema.user)
+          .limit(1);
 
-        if (!userSession?.user?.id) {
+        if (!defaultUser) {
           return {
-            content: [{ type: "text", text: "Error: User not authenticated" }],
+            content: [{ type: "text", text: "Error: No users found in system" }],
             isError: true,
           };
         }
@@ -284,7 +314,7 @@ function createMcpServer(env: Bindings, headers?: Headers) {
           .from(schema.oauthConnections)
           .where(
             and(
-              eq(schema.oauthConnections.userId, userSession.user.id),
+              eq(schema.oauthConnections.userId, defaultUser.id),
               eq(schema.oauthConnections.provider, "google")
             )
           );
@@ -385,13 +415,15 @@ function createMcpServer(env: Bindings, headers?: Headers) {
     },
     async ({ action, session_type, duration_minutes, mood }) => {
       try {
-        const userSession = await auth.api.getSession({
-          headers: headers || new Headers(),
-        });
+        // For MCP API key authentication, we'll use the first available user's connections
+        const [defaultUser] = await db
+          .select()
+          .from(schema.user)
+          .limit(1);
 
-        if (!userSession?.user?.id) {
+        if (!defaultUser) {
           return {
-            content: [{ type: "text", text: "Error: User not authenticated" }],
+            content: [{ type: "text", text: "Error: No users found in system" }],
             isError: true,
           };
         }
@@ -401,7 +433,7 @@ function createMcpServer(env: Bindings, headers?: Headers) {
           .from(schema.oauthConnections)
           .where(
             and(
-              eq(schema.oauthConnections.userId, userSession.user.id),
+              eq(schema.oauthConnections.userId, defaultUser.id),
               eq(schema.oauthConnections.provider, "spotify")
             )
           );
@@ -413,7 +445,16 @@ function createMcpServer(env: Bindings, headers?: Headers) {
           };
         }
 
-        const accessToken = await decryptToken(spotifyConnection.accessTokenHash, env.BETTER_AUTH_SECRET);
+        const accessToken = await getToken(env.KV, spotifyConnection.accessTokenHash);
+        if (!accessToken) {
+          return {
+            content: [{
+              type: "text",
+              text: "Failed to retrieve Spotify access token"
+            }],
+            isError: true
+          };
+        }
         let result = "";
 
         if (action === "start") {
@@ -430,7 +471,7 @@ function createMcpServer(env: Bindings, headers?: Headers) {
             
             // Record music session
             await db.insert(schema.musicSessions).values({
-              userId: userSession.user.id,
+              userId: defaultUser.id,
               sessionType: session_type,
               playlistId: focusPlaylist.id,
               durationMinutes: duration_minutes || 60,
@@ -446,7 +487,7 @@ function createMcpServer(env: Bindings, headers?: Headers) {
           const [latestSession] = await db
             .select()
             .from(schema.musicSessions)
-            .where(eq(schema.musicSessions.userId, userSession.user.id))
+            .where(eq(schema.musicSessions.userId, defaultUser.id))
             .orderBy(desc(schema.musicSessions.startedAt))
             .limit(1);
 
@@ -483,18 +524,20 @@ function createMcpServer(env: Bindings, headers?: Headers) {
     {
       source_type: z.enum(["email", "note", "transcript"]).describe("Type of content source"),
       content: z.string().describe("Raw text content to analyze for tasks"),
-      clickup_space_id: z.string().describe("ClickUp space ID for task creation"),
+      clickup_list_id: z.string().describe("ClickUp list ID for task creation"),
       priority_level: z.enum(["low", "normal", "high", "urgent"]).default("normal").describe("Default priority for extracted tasks"),
     },
-    async ({ source_type, content, clickup_space_id, priority_level }) => {
+    async ({ source_type, content, clickup_list_id, priority_level }) => {
       try {
-        const userSession = await auth.api.getSession({
-          headers: headers || new Headers(),
-        });
+        // For MCP API key authentication, we'll use the first available user's connections
+        const [defaultUser] = await db
+          .select()
+          .from(schema.user)
+          .limit(1);
 
-        if (!userSession?.user?.id) {
+        if (!defaultUser) {
           return {
-            content: [{ type: "text", text: "Error: User not authenticated" }],
+            content: [{ type: "text", text: "Error: No users found in system" }],
             isError: true,
           };
         }
@@ -504,7 +547,7 @@ function createMcpServer(env: Bindings, headers?: Headers) {
           .from(schema.oauthConnections)
           .where(
             and(
-              eq(schema.oauthConnections.userId, userSession.user.id),
+              eq(schema.oauthConnections.userId, defaultUser.id),
               eq(schema.oauthConnections.provider, "clickup")
             )
           );
@@ -523,27 +566,54 @@ function createMcpServer(env: Bindings, headers?: Headers) {
 
         const model = openai("gpt-4o-mini");
 
-        const response = await generateText({
-          model,
-          messages: [
-            {
-              role: "system",
-              content: `You are a task extraction expert. Analyze the provided ${source_type} content and extract actionable tasks. Return a JSON array of tasks with the following structure: [{"title": "Task title", "description": "Task description", "priority": "low|normal|high|urgent"}]. Only extract clear, actionable tasks. If no tasks are found, return an empty array.`,
-            },
-            {
-              role: "user",
-              content: content,
-            },
-          ],
-        });
+        let response;
+        try {
+          response = await generateText({
+            model,
+            messages: [
+              {
+                role: "system",
+                content: `You are a task extraction expert. Analyze the provided ${source_type} content and extract actionable tasks. Return a JSON array of tasks with the following structure: [{"title": "Task title", "description": "Task description", "priority": "low|normal|high|urgent"}]. Only extract clear, actionable tasks. If no tasks are found, return an empty array.`,
+              },
+              {
+                role: "user",
+                content: content,
+              },
+            ],
+          });
+        } catch (openaiError) {
+          console.error('OpenAI API error:', openaiError);
+          return {
+            content: [{ 
+              type: "text", 
+              text: `Error calling OpenAI API: ${openaiError instanceof Error ? openaiError.message : "Unknown error"}` 
+            }],
+            isError: true,
+          };
+        }
 
         let extractedTasks: Array<{ title: string; description: string; priority: string }> = [];
         
+        console.log('OpenAI response:', response.text);
+        
         try {
-          extractedTasks = JSON.parse(response.text);
+          // Extract JSON from markdown code blocks if present
+          let jsonText = response.text.trim();
+          if (jsonText.startsWith('```json') && jsonText.endsWith('```')) {
+            jsonText = jsonText.slice(7, -3).trim(); // Remove ```json and ```
+          } else if (jsonText.startsWith('```') && jsonText.endsWith('```')) {
+            jsonText = jsonText.slice(3, -3).trim(); // Remove ``` and ```
+          }
+          
+          extractedTasks = JSON.parse(jsonText);
         } catch (parseError) {
+          console.error('Failed to parse OpenAI response:', parseError);
+          console.error('Raw response text:', response.text);
           return {
-            content: [{ type: "text", text: "Error: Failed to parse AI response" }],
+            content: [{ 
+              type: "text", 
+              text: `Error: Failed to parse AI response. Raw response: ${response.text.substring(0, 200)}...` 
+            }],
             isError: true,
           };
         }
@@ -555,19 +625,33 @@ function createMcpServer(env: Bindings, headers?: Headers) {
         }
 
         // Create tasks in ClickUp
-        const clickupAccessToken = await decryptToken(clickupConnection.accessTokenHash, env.BETTER_AUTH_SECRET);
+        const clickupAccessToken = await getToken(env.KV, clickupConnection.accessTokenHash);
+        if (!clickupAccessToken) {
+          return {
+            content: [{
+              type: "text",
+              text: "Failed to retrieve ClickUp access token"
+            }],
+            isError: true
+          };
+        }
         const createdTaskIds: string[] = [];
 
         for (const task of extractedTasks) {
           try {
-            const clickupTask = await createClickUpTask(clickupAccessToken, clickup_space_id, {
+            const clickupTask = await createClickUpTask(clickupAccessToken, clickup_list_id, {
               name: task.title,
               description: task.description,
               priority: task.priority || priority_level,
             });
-            createdTaskIds.push(clickupTask.id);
+            
+            if (clickupTask && clickupTask.id) {
+              createdTaskIds.push(clickupTask.id);
+            } else {
+              console.error("ClickUp task creation returned invalid response:", clickupTask);
+            }
           } catch (error) {
-            console.error("Failed to create ClickUp task:", error);
+            console.error(`Failed to create ClickUp task "${task.title}":`, error);
           }
         }
 
@@ -580,7 +664,7 @@ function createMcpServer(env: Bindings, headers?: Headers) {
         const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 
         await db.insert(schema.taskSynthesisHistory).values({
-          userId: userSession.user.id,
+          userId: defaultUser.id,
           sourceType: source_type,
           sourceContentHash: hashHex,
           extractedTasks: extractedTasks,
@@ -633,13 +717,12 @@ app.get("/", (c) => {
 // Debug endpoint to check configuration
 app.get("/debug/auth", async (c) => {
   return c.json({
-    hasClientId: !!c.env.FP_CLIENT_ID,
-    hasClientSecret: !!c.env.FP_CLIENT_SECRET,
-    hasAuthIssuer: !!c.env.FP_AUTH_ISSUER,
     hasMcpApiKey: !!c.env.MCP_API_KEY,
     hasBaseUrl: !!c.env.BASE_URL,
     baseUrl: c.env.BASE_URL,
-    issuer: c.env.FP_AUTH_ISSUER,
+    hasGoogleOAuth: !!(c.env.GOOGLE_CLIENT_ID && c.env.GOOGLE_CLIENT_SECRET),
+    hasSpotifyOAuth: !!(c.env.SPOTIFY_CLIENT_ID && c.env.SPOTIFY_CLIENT_SECRET),
+    hasClickUpOAuth: !!(c.env.CLICKUP_CLIENT_ID && c.env.CLICKUP_CLIENT_SECRET),
   });
 });
 
@@ -660,28 +743,6 @@ app.get("/debug/oauth", async (c) => {
       hasClientSecret: !!c.env.CLICKUP_CLIENT_SECRET,
     }
   });
-});
-
-// Test Better Auth routes
-app.get("/debug/auth-routes", async (c) => {
-  const auth = createAuth(c.env);
-  try {
-    // Try to get available endpoints from Better Auth
-    const testRequest = new Request(`${c.env.BETTER_AUTH_URL}/api/auth/`, {
-      method: 'GET',
-    });
-    const response = await auth.handler(testRequest);
-    const text = await response.text();
-    return c.json({ 
-      status: response.status,
-      response: text 
-    });
-  } catch (error) {
-    return c.json({ 
-      error: error instanceof Error ? error.message : 'Unknown error',
-      stack: error instanceof Error ? error.stack : undefined
-    });
-  }
 });
 
 // Session middleware helper
@@ -708,100 +769,6 @@ async function getSession(c: any) {
     return null;
   }
 }
-
-// Direct OAuth callback handler
-app.get("/auth/callback", async (c) => {
-  const code = c.req.query('code');
-  const state = c.req.query('state');
-  const error = c.req.query('error');
-
-  if (error) {
-    return c.html(`<h1>Authentication Error</h1><p>Error: ${error}</p><a href="/login">Try Again</a>`);
-  }
-
-  if (!code || !state) {
-    return c.html(`<h1>Authentication Error</h1><p>Missing authorization code or state</p><a href="/login">Try Again</a>`);
-  }
-
-  try {
-    // Validate state parameter
-    const storedState = await c.env.KV.get(`oauth_state_${state}`);
-    if (!storedState) {
-      return c.html(`<h1>Authentication Error</h1><p>Invalid or expired state parameter</p><a href="/login">Try Again</a>`);
-    }
-
-    // Clean up state
-    await c.env.KV.delete(`oauth_state_${state}`);
-
-    // Exchange code for tokens
-    const tokenResponse = await fetch(`${c.env.FP_AUTH_ISSUER}/oauth/token`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: new URLSearchParams({
-        grant_type: 'authorization_code',
-        code: code,
-        client_id: c.env.FP_CLIENT_ID,
-        client_secret: c.env.FP_CLIENT_SECRET,
-        redirect_uri: `${new URL(c.req.url).origin}/auth/callback`,
-      }),
-    });
-
-    if (!tokenResponse.ok) {
-      const errorText = await tokenResponse.text();
-      return c.html(`<h1>Token Exchange Error</h1><p>Failed to exchange code for tokens: ${errorText}</p><a href="/login">Try Again</a>`);
-    }
-
-    const tokens = await tokenResponse.json() as {
-      access_token: string;
-      id_token?: string;
-      refresh_token?: string;
-      expires_in?: number;
-    };
-
-    // Get user info
-    const userResponse = await fetch(`${c.env.FP_AUTH_ISSUER}/userinfo`, {
-      headers: {
-        'Authorization': `Bearer ${tokens.access_token}`,
-      },
-    });
-
-    if (!userResponse.ok) {
-      return c.html(`<h1>User Info Error</h1><p>Failed to get user information</p><a href="/login">Try Again</a>`);
-    }
-
-    const userInfo = await userResponse.json() as {
-      sub: string;
-      email?: string;
-      name?: string;
-      login?: string;
-      githubUserId?: string;
-    };
-
-    // Create session token (simple JWT-like structure)
-    const sessionData = {
-      userId: userInfo.sub || userInfo.githubUserId || 'unknown',
-      email: userInfo.email,
-      name: userInfo.name || userInfo.login,
-      accessToken: tokens.access_token,
-      createdAt: Date.now(),
-      expiresAt: Date.now() + (tokens.expires_in || 3600) * 1000,
-    };
-
-    // Store session in KV (expires in 24 hours)
-    const sessionId = crypto.randomUUID();
-    await c.env.KV.put(`session_${sessionId}`, JSON.stringify(sessionData), { expirationTtl: 86400 });
-
-    // Set session cookie and redirect to dashboard
-    c.header('Set-Cookie', `session=${sessionId}; HttpOnly; Secure; SameSite=Strict; Max-Age=86400; Path=/`);
-    return c.redirect('/dashboard');
-
-  } catch (error) {
-    console.error('OAuth callback error:', error);
-    return c.html(`<h1>Authentication Error</h1><p>An unexpected error occurred: ${error instanceof Error ? error.message : 'Unknown error'}</p><a href="/login">Try Again</a>`);
-  }
-});
 
 // Authentication routes
 app.get("/login", (c) => {
@@ -1132,114 +1099,6 @@ app.get("/dashboard", async (c) => {
   );
 });
 
-// Better Auth routes - handle all methods
-app.all("/api/auth/*", (c) => {
-  const auth = createAuth(c.env);
-  return auth.handler(c.req.raw);
-});
-
-// OAuth connection endpoints
-app.post("/oauth/connect/:provider", async (c) => {
-  const provider = c.req.param("provider") as "google" | "spotify" | "clickup";
-  const { code } = await c.req.json();
-
-  const auth = createAuth(c.env);
-  const userSession = await auth.api.getSession({
-    headers: c.req.raw.headers,
-  });
-
-  if (!userSession?.user?.id) {
-    return c.json({ error: "User not authenticated" }, 401);
-  }
-
-  try {
-    const db = drizzle(c.env.DB);
-    
-    // Exchange code for tokens based on provider
-    let tokenResponse: any;
-    let clientId: string;
-    let clientSecret: string;
-    let tokenUrl: string;
-
-    switch (provider) {
-      case "google":
-        clientId = c.env.GOOGLE_CLIENT_ID;
-        clientSecret = c.env.GOOGLE_CLIENT_SECRET;
-        tokenUrl = "https://oauth2.googleapis.com/token";
-        break;
-      case "spotify":
-        clientId = c.env.SPOTIFY_CLIENT_ID;
-        clientSecret = c.env.SPOTIFY_CLIENT_SECRET;
-        tokenUrl = "https://accounts.spotify.com/api/token";
-        break;
-      case "clickup":
-        clientId = c.env.CLICKUP_CLIENT_ID;
-        clientSecret = c.env.CLICKUP_CLIENT_SECRET;
-        tokenUrl = "https://api.clickup.com/api/v2/oauth/token";
-        break;
-      default:
-        return c.json({ error: "Unsupported provider" }, 400);
-    }
-
-    const tokenRequestBody = new URLSearchParams({
-      grant_type: "authorization_code",
-      code,
-      client_id: clientId,
-      client_secret: clientSecret,
-    });
-
-    const response = await fetch(tokenUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded",
-      },
-      body: tokenRequestBody,
-    });
-
-    tokenResponse = await response.json();
-
-    if (!tokenResponse.access_token) {
-      return c.json({ error: "Failed to obtain access token" }, 400);
-    }
-
-    // Encrypt and store tokens
-    const accessTokenHash = await encryptToken(tokenResponse.access_token, c.env.BETTER_AUTH_SECRET);
-    const refreshTokenHash = tokenResponse.refresh_token 
-      ? await encryptToken(tokenResponse.refresh_token, c.env.BETTER_AUTH_SECRET)
-      : null;
-
-    const expiresAt = tokenResponse.expires_in 
-      ? new Date(Date.now() + tokenResponse.expires_in * 1000)
-      : null;
-
-    // Store or update OAuth connection
-    await db.insert(schema.oauthConnections).values({
-      userId: userSession.user.id,
-      provider,
-      providerUserId: "unknown", // Would need to fetch user info
-      accessTokenHash,
-      refreshTokenHash,
-      expiresAt,
-      scopes: tokenResponse.scope ? tokenResponse.scope.split(" ") : [],
-    }).onConflictDoUpdate({
-      target: [schema.oauthConnections.userId, schema.oauthConnections.provider],
-      set: {
-        accessTokenHash,
-        refreshTokenHash,
-        expiresAt,
-        updatedAt: new Date(),
-      },
-    });
-
-    return c.json({ success: true, provider });
-  } catch (error) {
-    return c.json({ 
-      error: `Failed to connect ${provider}`, 
-      details: error instanceof Error ? error.message : "Unknown error" 
-    }, 500);
-  }
-});
-
 // Webhook endpoints
 app.post("/webhooks/google", async (c) => {
   // Handle Google Calendar webhook notifications
@@ -1281,7 +1140,11 @@ app.post("/cron/calendar-defense", async (c) => {
 
     for (const connection of connections) {
       try {
-        const accessToken = await decryptToken(connection.accessTokenHash, c.env.BETTER_AUTH_SECRET);
+        const accessToken = await getToken(c.env.KV, connection.accessTokenHash);
+        if (!accessToken) {
+          console.error(`Failed to retrieve access token for user ${connection.userId}`);
+          continue;
+        }
         
         // Get today's events
         const today = new Date();
@@ -1337,7 +1200,11 @@ app.post("/cron/token-refresh", async (c) => {
       }
 
       try {
-        const refreshToken = await decryptToken(connection.refreshTokenHash, c.env.BETTER_AUTH_SECRET);
+        const refreshToken = await getToken(c.env.KV, connection.refreshTokenHash);
+        if (!refreshToken) {
+          console.error(`Failed to retrieve refresh token for connection ${connection.id}`);
+          continue;
+        }
         
         // Refresh token logic would depend on the provider
         // This is a simplified example
@@ -1380,10 +1247,14 @@ app.post("/cron/token-refresh", async (c) => {
         };
 
         if (tokenData.access_token) {
-          const newAccessTokenHash = await encryptToken(tokenData.access_token, c.env.BETTER_AUTH_SECRET);
-          const newRefreshTokenHash = tokenData.refresh_token 
-            ? await encryptToken(tokenData.refresh_token, c.env.BETTER_AUTH_SECRET)
-            : connection.refreshTokenHash;
+          const newAccessTokenHash = await hashToken(tokenData.access_token);
+          await storeToken(c.env.KV, newAccessTokenHash, tokenData.access_token);
+          
+          let newRefreshTokenHash = connection.refreshTokenHash;
+          if (tokenData.refresh_token) {
+            newRefreshTokenHash = await hashToken(tokenData.refresh_token);
+            await storeToken(c.env.KV, newRefreshTokenHash, tokenData.refresh_token);
+          }
 
           await db
             .update(schema.oauthConnections)
@@ -1425,34 +1296,23 @@ app.all("/mcp", mcpAuthMiddleware, async (c) => {
 
 // API endpoints for user management
 app.get("/api/user/profile", async (c) => {
-  const auth = createAuth(c.env);
-  const userSession = await auth.api.getSession({
-    headers: c.req.raw.headers,
-  });
-
-  if (!userSession?.user) {
-    return c.json({ error: "Not authenticated" }, 401);
-  }
-
+  // For MCP API key authentication, return default user profile
   const db = drizzle(c.env.DB);
   const [user] = await db
     .select()
     .from(schema.user)
-    .where(eq(schema.user.id, userSession.user.id));
+    .where(eq(schema.user.id, "default-user"))
+    .limit(1);
+
+  if (!user) {
+    return c.json({ error: "Default user not found" }, 404);
+  }
 
   return c.json({ user });
 });
 
 app.get("/api/user/connections", async (c) => {
-  const auth = createAuth(c.env);
-  const userSession = await auth.api.getSession({
-    headers: c.req.raw.headers,
-  });
-
-  if (!userSession?.user) {
-    return c.json({ error: "Not authenticated" }, 401);
-  }
-
+  // For MCP API key authentication, return default user connections
   const db = drizzle(c.env.DB);
   const connections = await db
     .select({
@@ -1461,26 +1321,18 @@ app.get("/api/user/connections", async (c) => {
       expiresAt: schema.oauthConnections.expiresAt,
     })
     .from(schema.oauthConnections)
-    .where(eq(schema.oauthConnections.userId, userSession.user.id));
+    .where(eq(schema.oauthConnections.userId, "default-user"));
 
   return c.json({ connections });
 });
 
 app.get("/api/user/music-sessions", async (c) => {
-  const auth = createAuth(c.env);
-  const userSession = await auth.api.getSession({
-    headers: c.req.raw.headers,
-  });
-
-  if (!userSession?.user) {
-    return c.json({ error: "Not authenticated" }, 401);
-  }
-
+  // For MCP API key authentication, return default user music sessions
   const db = drizzle(c.env.DB);
   const sessions = await db
     .select()
     .from(schema.musicSessions)
-    .where(eq(schema.musicSessions.userId, userSession.user.id))
+    .where(eq(schema.musicSessions.userId, "default-user"))
     .orderBy(desc(schema.musicSessions.startedAt))
     .limit(50);
 
@@ -1488,24 +1340,255 @@ app.get("/api/user/music-sessions", async (c) => {
 });
 
 app.get("/api/user/task-history", async (c) => {
-  const auth = createAuth(c.env);
-  const userSession = await auth.api.getSession({
-    headers: c.req.raw.headers,
-  });
-
-  if (!userSession?.user) {
-    return c.json({ error: "Not authenticated" }, 401);
-  }
-
+  // For MCP API key authentication, return default user task history
   const db = drizzle(c.env.DB);
   const history = await db
     .select()
     .from(schema.taskSynthesisHistory)
-    .where(eq(schema.taskSynthesisHistory.userId, userSession.user.id))
+    .where(eq(schema.taskSynthesisHistory.userId, "default-user"))
     .orderBy(desc(schema.taskSynthesisHistory.createdAt))
     .limit(50);
 
   return c.json({ history });
+});
+
+// ClickUp debugging endpoint
+app.get("/api/clickup/debug", async (c) => {
+  const db = drizzle(c.env.DB);
+  
+  // Check if default user has ClickUp connection
+  const [clickupConnection] = await db
+    .select()
+    .from(schema.oauthConnections)
+    .where(
+      and(
+        eq(schema.oauthConnections.userId, "default-user"),
+        eq(schema.oauthConnections.provider, "clickup")
+      )
+    );
+
+  if (!clickupConnection) {
+    return c.json({
+      hasConnection: false,
+      message: "No ClickUp connection found for default user",
+      connectUrl: `${new URL(c.req.url).origin}/oauth/connect/clickup`
+    });
+  }
+
+  // Try to get access token
+  const accessToken = await getToken(c.env.KV, clickupConnection.accessTokenHash);
+  
+  if (!accessToken) {
+    return c.json({
+      hasConnection: true,
+      hasValidToken: false,
+      message: "ClickUp connection exists but token is not available",
+      connectionInfo: {
+        createdAt: clickupConnection.createdAt,
+        expiresAt: clickupConnection.expiresAt,
+        scopes: clickupConnection.scopes
+      }
+    });
+  }
+
+  // Try to get user's spaces
+  try {
+    const spacesResponse = await fetch("https://api.clickup.com/api/v2/team", {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+    });
+
+    if (!spacesResponse.ok) {
+      const errorText = await spacesResponse.text();
+      return c.json({
+        hasConnection: true,
+        hasValidToken: true,
+        apiError: true,
+        message: "ClickUp API error when fetching teams",
+        error: errorText,
+        status: spacesResponse.status
+      });
+    }
+
+    const teamsData = await spacesResponse.json() as any;
+    
+    // Also try to get spaces separately
+    const allSpaces: any[] = [];
+    const allLists: any[] = [];
+    
+    if (teamsData.teams && teamsData.teams.length > 0) {
+      for (const team of teamsData.teams) {
+        try {
+          const teamSpacesResponse = await fetch(`https://api.clickup.com/api/v2/team/${team.id}/space`, {
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+            },
+          });
+          
+          if (teamSpacesResponse.ok) {
+            const spacesData = await teamSpacesResponse.json() as any;
+            if (spacesData.spaces) {
+              for (const space of spacesData.spaces) {
+                allSpaces.push({
+                  id: space.id,
+                  name: space.name,
+                  teamId: team.id,
+                  teamName: team.name
+                });
+                
+                // Get lists for each space
+                try {
+                  const listsResponse = await fetch(`https://api.clickup.com/api/v2/space/${space.id}/list`, {
+                    headers: {
+                      Authorization: `Bearer ${accessToken}`,
+                    },
+                  });
+                  
+                  if (listsResponse.ok) {
+                    const listsData = await listsResponse.json() as any;
+                    if (listsData.lists) {
+                      allLists.push(...listsData.lists.map((list: any) => ({
+                        id: list.id,
+                        name: list.name,
+                        spaceId: space.id,
+                        spaceName: space.name,
+                        teamId: team.id,
+                        teamName: team.name
+                      })));
+                    }
+                  }
+                } catch (listError) {
+                  console.error(`Error fetching lists for space ${space.id}:`, listError);
+                }
+              }
+            }
+          }
+        } catch (spaceError) {
+          console.error(`Error fetching spaces for team ${team.id}:`, spaceError);
+        }
+      }
+    }
+    
+    return c.json({
+      hasConnection: true,
+      hasValidToken: true,
+      apiWorking: true,
+      teams: teamsData.teams?.map((team: any) => ({
+        id: team.id,
+        name: team.name,
+        spaces: team.spaces?.map((space: any) => ({
+          id: space.id,
+          name: space.name
+        }))
+      })) || [],
+      allSpaces: allSpaces,
+      allLists: allLists,
+      suggestedListId: allLists.length > 0 ? allLists[0].id : null,
+      message: allLists.length > 0 
+        ? `Found ${allLists.length} lists. Use list ID: ${allLists[0].id} for task creation.`
+        : allSpaces.length > 0
+          ? `Found ${allSpaces.length} spaces but no lists. Create a list in ClickUp first.`
+          : "No spaces or lists found. Create a space and list in ClickUp first."
+    });
+
+  } catch (error) {
+    return c.json({
+      hasConnection: true,
+      hasValidToken: true,
+      apiError: true,
+      message: "Error calling ClickUp API",
+      error: error instanceof Error ? error.message : "Unknown error"
+    });
+  }
+});
+
+// Test ClickUp task creation
+app.post("/api/clickup/test-task", async (c) => {
+  const { listId, taskName } = await c.req.json();
+  
+  if (!listId || !taskName) {
+    return c.json({ error: "Missing listId or taskName" }, 400);
+  }
+
+  const db = drizzle(c.env.DB);
+  
+  // Get ClickUp connection
+  const [clickupConnection] = await db
+    .select()
+    .from(schema.oauthConnections)
+    .where(
+      and(
+        eq(schema.oauthConnections.userId, "default-user"),
+        eq(schema.oauthConnections.provider, "clickup")
+      )
+    );
+
+  if (!clickupConnection) {
+    return c.json({ error: "No ClickUp connection found" });
+  }
+
+  const accessToken = await getToken(c.env.KV, clickupConnection.accessTokenHash);
+  if (!accessToken) {
+    return c.json({ error: "No valid access token" });
+  }
+
+  try {
+    const task = await createClickUpTask(accessToken, listId, {
+      name: taskName,
+      description: "Test task created via API",
+      priority: "normal"
+    });
+
+    return c.json({ 
+      success: true, 
+      task: task,
+      message: "Task created successfully!"
+    });
+  } catch (error) {
+    return c.json({ 
+      error: "Failed to create task",
+      details: error instanceof Error ? error.message : "Unknown error"
+    });
+  }
+});
+
+// Token status debug endpoint
+app.get("/api/clickup/token-status", async (c) => {
+  const db = drizzle(c.env.DB);
+  
+  const [clickupConnection] = await db
+    .select()
+    .from(schema.oauthConnections)
+    .where(
+      and(
+        eq(schema.oauthConnections.userId, "default-user"),
+        eq(schema.oauthConnections.provider, "clickup")
+      )
+    );
+
+  if (!clickupConnection) {
+    return c.json({ error: "No ClickUp connection found" });
+  }
+
+  const now = new Date();
+  const timeUntilExpiry = clickupConnection.expiresAt 
+    ? clickupConnection.expiresAt.getTime() - now.getTime()
+    : null;
+
+  return c.json({
+    connectionId: clickupConnection.id,
+    userId: clickupConnection.userId,
+    provider: clickupConnection.provider,
+    createdAt: clickupConnection.createdAt,
+    updatedAt: clickupConnection.updatedAt,
+    expiresAt: clickupConnection.expiresAt,
+    hasRefreshToken: !!clickupConnection.refreshTokenHash,
+    isExpired: clickupConnection.expiresAt ? now > clickupConnection.expiresAt : false,
+    timeUntilExpiryMs: timeUntilExpiry,
+    timeUntilExpiryHours: timeUntilExpiry ? Math.round(timeUntilExpiry / (1000 * 60 * 60)) : null,
+    scopes: clickupConnection.scopes
+  });
 });
 
 // API Documentation viewer
