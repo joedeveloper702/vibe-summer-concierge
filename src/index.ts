@@ -196,7 +196,14 @@ async function createGoogleCalendarEvent(accessToken: string, event: Partial<Goo
       body: JSON.stringify(event),
     }
   );
-  return await response.json() as GoogleCalendarEvent;
+  
+  const result = await response.json() as any;
+  
+  if (!response.ok) {
+    throw new Error(`Google Calendar API error: ${result.error?.message || 'Unknown error'}`);
+  }
+  
+  return result as GoogleCalendarEvent;
 }
 
 async function getSpotifyPlaylists(accessToken: string): Promise<SpotifyPlaylist[]> {
@@ -397,6 +404,110 @@ function createMcpServer(env: Bindings, headers?: Headers) {
           content: [{ 
             type: "text", 
             text: `Error managing calendar: ${error instanceof Error ? error.message : "Unknown error"}` 
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Calendar event creation tool
+  server.tool(
+    "calendar.create_event",
+    {
+      title: z.string().describe("Event title/summary"),
+      start_time: z.string().describe("Start time in ISO format (e.g., 2025-08-09T10:00:00-07:00 for Pacific Time, or 2025-08-09T10:00:00Z for UTC)"),
+      end_time: z.string().describe("End time in ISO format (e.g., 2025-08-09T11:00:00-07:00 for Pacific Time, or 2025-08-09T11:00:00Z for UTC)"),
+      description: z.string().optional().describe("Event description"),
+      location: z.string().optional().describe("Event location"),
+      attendees: z.array(z.string()).optional().describe("Array of attendee email addresses"),
+      timezone: z.string().optional().describe("IANA timezone (e.g., 'America/Los_Angeles', 'America/New_York'). If not provided, will use the time as specified."),
+    },
+    async ({ title, start_time, end_time, description, location, attendees, timezone }) => {
+      try {
+        // For MCP API key authentication, we'll use the first available user's connections
+        const [defaultUser] = await db
+          .select()
+          .from(schema.user)
+          .limit(1);
+
+        if (!defaultUser) {
+          return {
+            content: [{ type: "text", text: "Error: No users found in system" }],
+            isError: true,
+          };
+        }
+
+        const [googleConnection] = await db
+          .select()
+          .from(schema.oauthConnections)
+          .where(
+            and(
+              eq(schema.oauthConnections.userId, defaultUser.id),
+              eq(schema.oauthConnections.provider, "google")
+            )
+          );
+
+        if (!googleConnection) {
+          return {
+            content: [{ type: "text", text: "Error: Google Calendar not connected" }],
+            isError: true,
+          };
+        }
+
+        const accessToken = await getToken(env.KV, googleConnection.accessTokenHash);
+        if (!accessToken) {
+          return {
+            content: [{
+              type: "text",
+              text: "Failed to retrieve Google Calendar access token"
+            }],
+            isError: true
+          };
+        }
+
+        // Create the event object with timezone support
+        const eventData: any = {
+          summary: title,
+          start: timezone ? 
+            { dateTime: start_time, timeZone: timezone } : 
+            { dateTime: start_time },
+          end: timezone ? 
+            { dateTime: end_time, timeZone: timezone } : 
+            { dateTime: end_time },
+        };
+
+        if (description) {
+          eventData.description = description;
+        }
+
+        if (location) {
+          eventData.location = location;
+        }
+
+        if (attendees && attendees.length > 0) {
+          eventData.attendees = attendees.map(email => ({ email }));
+        }
+
+        const createdEvent = await createGoogleCalendarEvent(accessToken, eventData);
+
+        // Format the display time based on the input
+        const startDate = new Date(start_time);
+        const displayTime = timezone ? 
+          `${startDate.toLocaleString()} (${timezone})` : 
+          startDate.toLocaleString();
+
+        return {
+          content: [{
+            type: "text",
+            text: `Successfully created calendar event: "${title}" at ${displayTime}. Event ID: ${createdEvent.id}`
+          }],
+        };
+      } catch (error) {
+        return {
+          content: [{ 
+            type: "text", 
+            text: `Error creating calendar event: ${error instanceof Error ? error.message : "Unknown error"}` 
           }],
           isError: true,
         };
