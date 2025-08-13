@@ -290,7 +290,7 @@ function createMcpServer(env: Bindings, headers?: Headers) {
 
   // Calendar management tool
   server.tool(
-    "calendar.manage",
+    "calendar_manage",
     {
       action: z.enum(["defend", "optimize", "schedule"]).describe("Action to perform on calendar"),
       date_range: z.string().describe("Date range in format YYYY-MM-DD/YYYY-MM-DD"),
@@ -517,7 +517,7 @@ function createMcpServer(env: Bindings, headers?: Headers) {
 
   // Music focus tool
   server.tool(
-    "music.focus",
+    "music_focus",
     {
       action: z.enum(["start", "stop", "adjust"]).describe("Music control action"),
       session_type: z.enum(["focus", "deep_work", "break"]).describe("Type of work session"),
@@ -631,7 +631,7 @@ function createMcpServer(env: Bindings, headers?: Headers) {
 
   // Task synthesis tool
   server.tool(
-    "tasks.synthesize",
+    "tasks_synthesize",
     {
       source_type: z.enum(["email", "note", "transcript"]).describe("Type of content source"),
       content: z.string().describe("Raw text content to analyze for tasks"),
@@ -801,6 +801,312 @@ function createMcpServer(env: Bindings, headers?: Headers) {
     }
   );
 
+  // Calendar reading tool
+  server.tool(
+    "calendar_read_events",
+    {
+      date_range: z.string().describe("Date range to read events from (e.g., 'today', 'this_week', 'next_week', 'YYYY-MM-DD to YYYY-MM-DD')"),
+      max_results: z.number().optional().describe("Maximum number of events to return (default: 25)"),
+    },
+    async ({ date_range, max_results = 25 }) => {
+      try {
+        // For MCP API key authentication, we'll use the first available user's connections
+        const [defaultUser] = await db
+          .select()
+          .from(schema.user)
+          .limit(1);
+
+        if (!defaultUser) {
+          return {
+            content: [{ type: "text", text: "Error: No users found in system" }],
+            isError: true,
+          };
+        }
+
+        const [googleConnection] = await db
+          .select()
+          .from(schema.oauthConnections)
+          .where(
+            and(
+              eq(schema.oauthConnections.userId, defaultUser.id),
+              eq(schema.oauthConnections.provider, "google")
+            )
+          );
+
+        if (!googleConnection) {
+          return {
+            content: [{ type: "text", text: "Error: Google Calendar not connected" }],
+            isError: true,
+          };
+        }
+
+        const accessToken = await getToken(env.KV, googleConnection.accessTokenHash);
+        if (!accessToken) {
+          return {
+            content: [{
+              type: "text",
+              text: "Failed to retrieve Google Calendar access token"
+            }],
+            isError: true
+          };
+        }
+
+        // Parse date range
+        let timeMin: string, timeMax: string;
+        const now = new Date();
+        
+        switch (date_range.toLowerCase()) {
+          case 'today':
+            timeMin = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
+            timeMax = new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1).toISOString();
+            break;
+          case 'this_week':
+            const startOfWeek = new Date(now.getFullYear(), now.getMonth(), now.getDate() - now.getDay());
+            const endOfWeek = new Date(startOfWeek.getTime() + 7 * 24 * 60 * 60 * 1000);
+            timeMin = startOfWeek.toISOString();
+            timeMax = endOfWeek.toISOString();
+            break;
+          case 'next_week':
+            const nextWeekStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - now.getDay() + 7);
+            const nextWeekEnd = new Date(nextWeekStart.getTime() + 7 * 24 * 60 * 60 * 1000);
+            timeMin = nextWeekStart.toISOString();
+            timeMax = nextWeekEnd.toISOString();
+            break;
+          default:
+            // Try to parse custom date range like "2025-08-12 to 2025-08-15"
+            const dateRangeMatch = date_range.match(/(\d{4}-\d{2}-\d{2})\s+to\s+(\d{4}-\d{2}-\d{2})/);
+            if (dateRangeMatch) {
+              timeMin = new Date(dateRangeMatch[1] + 'T00:00:00Z').toISOString();
+              timeMax = new Date(dateRangeMatch[2] + 'T23:59:59Z').toISOString();
+            } else {
+              return {
+                content: [{ type: "text", text: "Invalid date range format. Use 'today', 'this_week', 'next_week', or 'YYYY-MM-DD to YYYY-MM-DD'" }],
+                isError: true,
+              };
+            }
+        }
+
+        // Fetch calendar events
+        const response = await fetch(
+          `https://www.googleapis.com/calendar/v3/calendars/primary/events?timeMin=${encodeURIComponent(timeMin)}&timeMax=${encodeURIComponent(timeMax)}&maxResults=${max_results}&singleEvents=true&orderBy=startTime`,
+          {
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+            },
+          }
+        );
+
+        const result = await response.json() as any;
+
+        if (!response.ok) {
+          throw new Error(`Google Calendar API error: ${result.error?.message || 'Unknown error'}`);
+        }
+
+        const events = result.items || [];
+        
+        if (events.length === 0) {
+          return {
+            content: [{
+              type: "text",
+              text: `No events found for ${date_range}`
+            }],
+          };
+        }
+
+        const eventsList = events.map((event: any) => {
+          const startTime = event.start?.dateTime || event.start?.date;
+          const endTime = event.end?.dateTime || event.end?.date;
+          return `• ${event.summary || 'No title'} (${new Date(startTime).toLocaleString()} - ${new Date(endTime).toLocaleString()})${event.location ? ` at ${event.location}` : ''}`;
+        }).join('\n');
+
+        return {
+          content: [{
+            type: "text",
+            text: `Found ${events.length} calendar events for ${date_range}:\n\n${eventsList}`
+          }],
+        };
+      } catch (error) {
+        return {
+          content: [{ 
+            type: "text", 
+            text: `Error reading calendar events: ${error instanceof Error ? error.message : "Unknown error"}` 
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
+  // Tasks reading tool
+  server.tool(
+    "tasks_read_list",
+    {
+      list_filter: z.string().optional().describe("Filter tasks by status: 'open', 'in_progress', 'completed', or 'all' (default: 'open')"),
+      max_results: z.number().optional().describe("Maximum number of tasks to return (default: 25)"),
+    },
+    async ({ list_filter = 'open', max_results = 25 }) => {
+      try {
+        // For MCP API key authentication, we'll use the first available user's connections
+        const [defaultUser] = await db
+          .select()
+          .from(schema.user)
+          .limit(1);
+
+        if (!defaultUser) {
+          return {
+            content: [{ type: "text", text: "Error: No users found in system" }],
+            isError: true,
+          };
+        }
+
+        const [clickupConnection] = await db
+          .select()
+          .from(schema.oauthConnections)
+          .where(
+            and(
+              eq(schema.oauthConnections.userId, defaultUser.id),
+              eq(schema.oauthConnections.provider, "clickup")
+            )
+          );
+
+        if (!clickupConnection) {
+          return {
+            content: [{ type: "text", text: "Error: ClickUp not connected" }],
+            isError: true,
+          };
+        }
+
+        const accessToken = await getToken(env.KV, clickupConnection.accessTokenHash);
+        if (!accessToken) {
+          return {
+            content: [{
+              type: "text",
+              text: "Failed to retrieve ClickUp access token"
+            }],
+            isError: true
+          };
+        }
+
+        // Get the team and space info
+        const teamsResponse = await fetch('https://api.clickup.com/api/v2/team', {
+          headers: {
+            Authorization: accessToken,
+          },
+        });
+
+        const teamsData = await teamsResponse.json() as any;
+        if (!teamsResponse.ok || !teamsData.teams?.length) {
+          throw new Error('Failed to get ClickUp teams');
+        }
+
+        const teamId = teamsData.teams[0].id;
+        
+        // Get spaces
+        const spacesResponse = await fetch(`https://api.clickup.com/api/v2/team/${teamId}/space?archived=false`, {
+          headers: {
+            Authorization: accessToken,
+          },
+        });
+
+        const spacesData = await spacesResponse.json() as any;
+        if (!spacesResponse.ok || !spacesData.spaces?.length) {
+          throw new Error('Failed to get ClickUp spaces');
+        }
+
+        const spaceId = spacesData.spaces[0].id;
+
+        // Get folders and lists
+        const foldersResponse = await fetch(`https://api.clickup.com/api/v2/space/${spaceId}/folder?archived=false`, {
+          headers: {
+            Authorization: accessToken,
+          },
+        });
+
+        const foldersData = await foldersResponse.json() as any;
+        let listId: string;
+
+        if (foldersData.folders?.length > 0) {
+          listId = foldersData.folders[0].lists[0].id;
+        } else {
+          // Try to get folderless lists
+          const listsResponse = await fetch(`https://api.clickup.com/api/v2/space/${spaceId}/list?archived=false`, {
+            headers: {
+              Authorization: accessToken,
+            },
+          });
+          const listsData = await listsResponse.json() as any;
+          if (!listsResponse.ok || !listsData.lists?.length) {
+            throw new Error('No lists found in ClickUp workspace');
+          }
+          listId = listsData.lists[0].id;
+        }
+
+        // Build status filter
+        let statusFilter = '';
+        switch (list_filter.toLowerCase()) {
+          case 'open':
+            statusFilter = '&statuses[]=Open&statuses[]=to do';
+            break;
+          case 'in_progress':
+            statusFilter = '&statuses[]=in progress&statuses[]=doing';
+            break;
+          case 'completed':
+            statusFilter = '&statuses[]=complete&statuses[]=closed&statuses[]=done';
+            break;
+          case 'all':
+            statusFilter = '';
+            break;
+        }
+
+        // Get tasks
+        const tasksResponse = await fetch(`https://api.clickup.com/api/v2/list/${listId}/task?archived=false${statusFilter}&page=0&order_by=created&reverse=true&subtasks=true&include_closed=${list_filter === 'all' || list_filter === 'completed'}`, {
+          headers: {
+            Authorization: accessToken,
+          },
+        });
+
+        const tasksData = await tasksResponse.json() as any;
+
+        if (!tasksResponse.ok) {
+          throw new Error(`ClickUp API error: ${tasksData.err || 'Unknown error'}`);
+        }
+
+        const tasks = (tasksData.tasks || []).slice(0, max_results);
+
+        if (tasks.length === 0) {
+          return {
+            content: [{
+              type: "text",
+              text: `No ${list_filter} tasks found`
+            }],
+          };
+        }
+
+        const tasksList = tasks.map((task: any) => {
+          const priority = task.priority ? ` [Priority: ${task.priority.priority}]` : '';
+          const dueDate = task.due_date ? ` [Due: ${new Date(parseInt(task.due_date)).toLocaleDateString()}]` : '';
+          const assignees = task.assignees?.length > 0 ? ` [Assigned: ${task.assignees.map((a: any) => a.username).join(', ')}]` : '';
+          return `• ${task.name} (${task.status.status})${priority}${dueDate}${assignees}`;
+        }).join('\n');
+
+        return {
+          content: [{
+            type: "text",
+            text: `Found ${tasks.length} ${list_filter} tasks:\n\n${tasksList}`
+          }],
+        };
+      } catch (error) {
+        return {
+          content: [{ 
+            type: "text", 
+            text: `Error reading tasks: ${error instanceof Error ? error.message : "Unknown error"}` 
+          }],
+          isError: true,
+        };
+      }
+    }
+  );
+
   return server;
 }
 
@@ -810,16 +1116,206 @@ app.get("/", (c) => {
     <html>
       <head>
         <title>Vibe Summer Concierge</title>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+          * { margin: 0; padding: 0; box-sizing: border-box; }
+          body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: #333;
+            line-height: 1.6;
+          }
+          .container {
+            background: rgba(255, 255, 255, 0.95);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 40px;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
+            max-width: 500px;
+            width: 90%;
+            text-align: center;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+          }
+          .logo {
+            font-size: 4rem;
+            margin-bottom: 20px;
+            animation: float 3s ease-in-out infinite;
+          }
+          @keyframes float {
+            0%, 100% { transform: translateY(0px); }
+            50% { transform: translateY(-10px); }
+          }
+          h1 {
+            font-size: 2.2rem;
+            font-weight: 700;
+            margin-bottom: 15px;
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+          }
+          .subtitle {
+            font-size: 1.1rem;
+            color: #666;
+            margin-bottom: 35px;
+            font-weight: 400;
+          }
+          .actions {
+            display: grid;
+            gap: 15px;
+          }
+          .btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+            padding: 16px 24px;
+            border-radius: 12px;
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 1rem;
+            transition: all 0.3s ease;
+            border: 2px solid transparent;
+            position: relative;
+            overflow: hidden;
+          }
+          .btn::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: -100%;
+            width: 100%;
+            height: 100%;
+            background: linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent);
+            transition: left 0.5s;
+          }
+          .btn:hover::before {
+            left: 100%;
+          }
+          .btn-primary {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.4);
+          }
+          .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(102, 126, 234, 0.6);
+          }
+          .btn-secondary {
+            background: #f8f9fa;
+            color: #495057;
+            border: 2px solid #e9ecef;
+          }
+          .btn-secondary:hover {
+            background: #e9ecef;
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+          }
+          .btn-google {
+            background: #4285f4;
+            color: white;
+          }
+          .btn-google:hover {
+            background: #3367d6;
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(66, 133, 244, 0.4);
+          }
+          .btn-spotify {
+            background: #1db954;
+            color: white;
+          }
+          .btn-spotify:hover {
+            background: #1ed760;
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(29, 185, 84, 0.4);
+          }
+          .btn-clickup {
+            background: #7b68ee;
+            color: white;
+          }
+          .btn-clickup:hover {
+            background: #6c5ce7;
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px rgba(123, 104, 238, 0.4);
+          }
+          .divider {
+            margin: 25px 0;
+            display: flex;
+            align-items: center;
+            color: #999;
+            font-size: 0.9rem;
+          }
+          .divider::before,
+          .divider::after {
+            content: '';
+            flex: 1;
+            height: 1px;
+            background: #e0e0e0;
+          }
+          .divider span {
+            padding: 0 15px;
+          }
+          .footer {
+            margin-top: 30px;
+            font-size: 0.85rem;
+            color: #999;
+          }
+          .status-indicator {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            background: #10b981;
+            border-radius: 50%;
+            margin-right: 8px;
+            animation: pulse 2s infinite;
+          }
+          @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+          }
+        </style>
       </head>
       <body>
-        <h1>Vibe Summer Concierge MCP Server</h1>
-        <p>Intelligent calendar management, focus music, and AI-powered task synthesis.</p>
-        <ul>
-          <li><a href="/login">Login</a></li>
-          <li><a href="/oauth/connect/google">Connect Google Calendar</a></li>
-          <li><a href="/oauth/connect/spotify">Connect Spotify</a></li>
-          <li><a href="/oauth/connect/clickup">Connect ClickUp</a></li>
-        </ul>
+        <div class="container">
+          <div class="logo">🎵</div>
+          <h1>Vibe Summer Concierge</h1>
+          <p class="subtitle">
+            <span class="status-indicator"></span>
+            Intelligent calendar management, focus music, and AI-powered task synthesis
+          </p>
+          
+          <div class="actions">
+            <a href="/login" class="btn btn-primary">
+              🔐 Access MCP Server
+            </a>
+            
+            <div class="divider">
+              <span>Connect Your Services</span>
+            </div>
+            
+            <a href="/oauth/connect/google" class="btn btn-google">
+              📅 Connect Google Calendar
+            </a>
+            
+            <a href="/oauth/connect/spotify" class="btn btn-spotify">
+              🎶 Connect Spotify
+            </a>
+            
+            <a href="/oauth/connect/clickup" class="btn btn-clickup">
+              ✅ Connect ClickUp
+            </a>
+          </div>
+          
+          <div class="footer">
+            <p>🤖 Powered by Model Context Protocol</p>
+          </div>
+        </div>
       </body>
     </html>
   `);
@@ -959,6 +1455,12 @@ app.get("/oauth/connect/:provider", async (c) => {
   authUrl.searchParams.set("scope", config.scopes);
   authUrl.searchParams.set("response_type", "code");
   authUrl.searchParams.set("state", state);
+  
+  // Add provider-specific parameters for refresh tokens
+  if (provider === "google") {
+    authUrl.searchParams.set("access_type", "offline");
+    authUrl.searchParams.set("prompt", "consent"); // Force consent to get refresh token
+  }
 
   return c.redirect(authUrl.toString());
 });
@@ -1030,7 +1532,12 @@ app.get("/oauth/callback/:provider", async (c) => {
           scopes: tokens.scope ? tokens.scope.split(" ") : []
         };
 
-        console.log('Inserting OAuth connection:', connectionData);
+        console.log('Inserting OAuth connection:', {
+          ...connectionData,
+          hasRefreshToken: !!refreshTokenHash,
+          expiresIn: tokens.expires_in,
+          tokenScopes: tokens.scope
+        });
 
         // Check for existing connection and update or insert
         const existingConnection = await db.select()
@@ -1334,6 +1841,11 @@ app.post("/cron/token-refresh", async (c) => {
             clientId = c.env.SPOTIFY_CLIENT_ID;
             clientSecret = c.env.SPOTIFY_CLIENT_SECRET;
             break;
+          case "clickup":
+            tokenUrl = "https://api.clickup.com/api/v2/oauth/token";
+            clientId = c.env.CLICKUP_CLIENT_ID;
+            clientSecret = c.env.CLICKUP_CLIENT_SECRET;
+            break;
           default:
             continue;
         }
@@ -1403,6 +1915,191 @@ app.all("/mcp", mcpAuthMiddleware, async (c) => {
 
   await mcpServer.connect(transport);
   return transport.handleRequest(c);
+});
+
+// Token status debug endpoint
+app.get("/debug/tokens", async (c) => {
+  const db = drizzle(c.env.DB);
+  
+  try {
+    const connections = await db
+      .select({
+        id: schema.oauthConnections.id,
+        provider: schema.oauthConnections.provider,
+        expiresAt: schema.oauthConnections.expiresAt,
+        hasRefreshToken: schema.oauthConnections.refreshTokenHash,
+        createdAt: schema.oauthConnections.createdAt,
+        updatedAt: schema.oauthConnections.updatedAt,
+      })
+      .from(schema.oauthConnections);
+
+    const now = new Date();
+    const oneHourFromNow = new Date(Date.now() + 60 * 60 * 1000);
+
+    const tokenStatus = connections.map(conn => ({
+      provider: conn.provider,
+      expiresAt: conn.expiresAt,
+      expiresIn: conn.expiresAt ? Math.round((conn.expiresAt.getTime() - now.getTime()) / (1000 * 60)) : null, // minutes
+      needsRefresh: conn.expiresAt ? conn.expiresAt <= oneHourFromNow : false,
+      hasRefreshToken: !!conn.hasRefreshToken,
+      lastUpdated: conn.updatedAt,
+    }));
+
+    return c.json({
+      currentTime: now.toISOString(),
+      oneHourFromNow: oneHourFromNow.toISOString(),
+      connections: tokenStatus,
+      summary: {
+        total: connections.length,
+        needingRefresh: tokenStatus.filter(t => t.needsRefresh).length,
+        withoutRefreshToken: tokenStatus.filter(t => !t.hasRefreshToken).length,
+      }
+    });
+  } catch (error) {
+    return c.json({ 
+      error: "Failed to get token status", 
+      details: error instanceof Error ? error.message : "Unknown error" 
+    }, 500);
+  }
+});
+
+// ClickUp debug endpoint
+app.get("/debug/clickup", async (c) => {
+  const db = drizzle(c.env.DB);
+  
+  try {
+    // Get ClickUp connection
+    const [defaultUser] = await db
+      .select()
+      .from(schema.user)
+      .limit(1);
+
+    if (!defaultUser) {
+      return c.json({ error: "No users found in system" });
+    }
+
+    const [clickupConnection] = await db
+      .select()
+      .from(schema.oauthConnections)
+      .where(
+        and(
+          eq(schema.oauthConnections.userId, defaultUser.id),
+          eq(schema.oauthConnections.provider, "clickup")
+        )
+      );
+
+    if (!clickupConnection) {
+      return c.json({ error: "ClickUp not connected" });
+    }
+
+    const accessToken = await getToken(c.env.KV, clickupConnection.accessTokenHash);
+    if (!accessToken) {
+      return c.json({ error: "Failed to retrieve ClickUp access token" });
+    }
+
+    // Get teams
+    const teamsResponse = await fetch('https://api.clickup.com/api/v2/team', {
+      headers: { Authorization: accessToken },
+    });
+    const teamsData = await teamsResponse.json() as any;
+    
+    if (!teamsResponse.ok) {
+      return c.json({ 
+        error: "Failed to get ClickUp teams", 
+        response: teamsData,
+        status: teamsResponse.status 
+      });
+    }
+
+    const teamId = teamsData.teams[0]?.id;
+    if (!teamId) {
+      return c.json({ error: "No teams found", teamsData });
+    }
+
+    // Get spaces
+    const spacesResponse = await fetch(`https://api.clickup.com/api/v2/team/${teamId}/space?archived=false`, {
+      headers: { Authorization: accessToken },
+    });
+    const spacesData = await spacesResponse.json() as any;
+
+    if (!spacesResponse.ok) {
+      return c.json({ 
+        error: "Failed to get spaces", 
+        response: spacesData,
+        status: spacesResponse.status 
+      });
+    }
+
+    const spaceId = spacesData.spaces[0]?.id;
+    if (!spaceId) {
+      return c.json({ error: "No spaces found", spacesData });
+    }
+
+    // Get folders and lists
+    const foldersResponse = await fetch(`https://api.clickup.com/api/v2/space/${spaceId}/folder?archived=false`, {
+      headers: { Authorization: accessToken },
+    });
+    const foldersData = await foldersResponse.json() as any;
+
+    let listId: string | null = null;
+    let debugInfo: any = {
+      teamId,
+      spaceId,
+      foldersFound: foldersData.folders?.length || 0,
+    };
+
+    if (foldersData.folders?.length > 0) {
+      listId = foldersData.folders[0].lists[0]?.id;
+      debugInfo.listFromFolder = listId;
+    } else {
+      // Try to get folderless lists
+      const listsResponse = await fetch(`https://api.clickup.com/api/v2/space/${spaceId}/list?archived=false`, {
+        headers: { Authorization: accessToken },
+      });
+      const listsData = await listsResponse.json() as any;
+      
+      if (listsResponse.ok && listsData.lists?.length > 0) {
+        listId = listsData.lists[0].id;
+        debugInfo.listFromSpace = listId;
+        debugInfo.folderlessLists = listsData.lists.length;
+      } else {
+        debugInfo.listsError = listsData;
+      }
+    }
+
+    if (!listId) {
+      return c.json({ 
+        error: "No lists found in ClickUp workspace",
+        debugInfo,
+        foldersData,
+      });
+    }
+
+    // Get tasks from the found list
+    const tasksResponse = await fetch(`https://api.clickup.com/api/v2/list/${listId}/task?archived=false&page=0&order_by=created&reverse=true&subtasks=true&include_closed=true`, {
+      headers: { Authorization: accessToken },
+    });
+    const tasksData = await tasksResponse.json() as any;
+
+    return c.json({
+      success: true,
+      debugInfo,
+      tasksFound: tasksData.tasks?.length || 0,
+      firstFewTasks: tasksData.tasks?.slice(0, 3).map((task: any) => ({
+        id: task.id,
+        name: task.name,
+        status: task.status?.status,
+        priority: task.priority?.priority,
+      })) || [],
+      rawTasksResponse: tasksData,
+    });
+
+  } catch (error) {
+    return c.json({ 
+      error: "Debug failed", 
+      details: error instanceof Error ? error.message : "Unknown error" 
+    }, 500);
+  }
 });
 
 // API endpoints for user management
@@ -1907,4 +2604,116 @@ app.use("/fp/*", createHonoMiddleware(app, {
   },
 }));
 
-export default app;
+// Scheduled event handler for cron jobs
+export default {
+  fetch: app.fetch,
+  scheduled: async (event: ScheduledEvent, env: Bindings, ctx: ExecutionContext) => {
+    console.log('Cron job triggered at:', new Date().toISOString());
+    
+    try {
+      // Refresh OAuth tokens
+      const db = drizzle(env.DB);
+      
+      // Get connections with tokens expiring in the next hour
+      const expiringConnections = await db
+        .select()
+        .from(schema.oauthConnections)
+        .where(
+          and(
+            lte(schema.oauthConnections.expiresAt, new Date(Date.now() + 60 * 60 * 1000)),
+            gte(schema.oauthConnections.expiresAt, new Date())
+          )
+        );
+
+      let refreshedTokens = 0;
+
+      for (const connection of expiringConnections) {
+        if (!connection.refreshTokenHash) {
+          continue;
+        }
+
+        try {
+          const refreshToken = await getToken(env.KV, connection.refreshTokenHash);
+          if (!refreshToken) {
+            console.error(`Failed to retrieve refresh token for connection ${connection.id}`);
+            continue;
+          }
+          
+          let tokenUrl: string;
+          let clientId: string;
+          let clientSecret: string;
+
+          switch (connection.provider) {
+            case "google":
+              tokenUrl = "https://oauth2.googleapis.com/token";
+              clientId = env.GOOGLE_CLIENT_ID;
+              clientSecret = env.GOOGLE_CLIENT_SECRET;
+              break;
+            case "spotify":
+              tokenUrl = "https://accounts.spotify.com/api/token";
+              clientId = env.SPOTIFY_CLIENT_ID;
+              clientSecret = env.SPOTIFY_CLIENT_SECRET;
+              break;
+            case "clickup":
+              tokenUrl = "https://api.clickup.com/api/v2/oauth/token";
+              clientId = env.CLICKUP_CLIENT_ID;
+              clientSecret = env.CLICKUP_CLIENT_SECRET;
+              break;
+            default:
+              continue;
+          }
+
+          const response = await fetch(tokenUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded",
+            },
+            body: new URLSearchParams({
+              grant_type: "refresh_token",
+              refresh_token: refreshToken,
+              client_id: clientId,
+              client_secret: clientSecret,
+            }),
+          });
+
+          const tokenData = await response.json() as {
+            access_token?: string;
+            refresh_token?: string;
+            expires_in?: number;
+          };
+
+          if (tokenData.access_token) {
+            const newAccessTokenHash = await hashToken(tokenData.access_token);
+            await storeToken(env.KV, newAccessTokenHash, tokenData.access_token);
+            
+            let newRefreshTokenHash = connection.refreshTokenHash;
+            if (tokenData.refresh_token) {
+              newRefreshTokenHash = await hashToken(tokenData.refresh_token);
+              await storeToken(env.KV, newRefreshTokenHash, tokenData.refresh_token);
+            }
+
+            await db
+              .update(schema.oauthConnections)
+              .set({
+                accessTokenHash: newAccessTokenHash,
+                refreshTokenHash: newRefreshTokenHash,
+                expiresAt: new Date(Date.now() + (tokenData.expires_in || 3600) * 1000),
+                updatedAt: new Date(),
+              })
+              .where(eq(schema.oauthConnections.id, connection.id));
+
+            refreshedTokens++;
+            console.log(`Successfully refreshed token for ${connection.provider} connection ${connection.id}`);
+          }
+        } catch (error) {
+          console.error(`Failed to refresh token for connection ${connection.id}:`, error);
+        }
+      }
+
+      console.log(`Cron job completed. Refreshed ${refreshedTokens} tokens.`);
+    } catch (error) {
+      console.error('Cron job failed:', error);
+    }
+  }
+};
+;
