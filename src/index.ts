@@ -413,7 +413,7 @@ function createMcpServer(env: Bindings, headers?: Headers) {
 
   // Calendar event creation tool
   server.tool(
-    "calendar.create_event",
+    "calendar_create_event",
     {
       title: z.string().describe("Event title/summary"),
       start_time: z.string().describe("Start time in ISO format (e.g., 2025-08-09T10:00:00-07:00 for Pacific Time, or 2025-08-09T10:00:00Z for UTC)"),
